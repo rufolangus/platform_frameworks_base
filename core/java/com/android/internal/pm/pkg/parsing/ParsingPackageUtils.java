@@ -2292,6 +2292,10 @@ public class ParsingPackageUtils {
 
                     result = systemServiceResult;
                     break;
+                case "mcp-server":
+                    // AAOSP: Parse MCP server declarations
+                    result = input.success(pkg);
+                    break;
                 default:
                     result = parseBaseAppChildTag(input, tagName, pkg, res, parser, flags);
                     break;

@@ -5704,6 +5704,15 @@ public abstract class Context {
     public static final String USB_SERVICE = "usb";
 
     /**
+     * Use with {@link #getSystemService(String)} to retrieve an
+     * {@link android.llm.LlmManager} for interacting with the on-device
+     * LLM System Service.
+     *
+     * @see #getSystemService(String)
+     */
+    public static final String LLM_SERVICE = "llm";
+
+    /**
      * Use with {@link #getSystemService(String)} to retrieve a {@link
      * Use with {@link #getSystemService} to retrieve a {@link
      * android.debug.AdbManager} for access to ADB debug functions.

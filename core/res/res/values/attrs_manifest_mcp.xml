@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright (C) 2024 The AAOSP Project
+
+     Licensed under the Apache License, Version 2.0 (the "License");
+     you may not use this file except in compliance with the License.
+     You may obtain a copy of the License at
+
+          http://www.apache.org/licenses/LICENSE-2.0
+
+     Unless required by applicable law or agreed to in writing, software
+     distributed under the License is distributed on an "AS IS" BASIS,
+     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+     See the License for the specific language governing permissions and
+     limitations under the License.
+-->
+
+<!--
+    MCP manifest attributes for AAOSP.
+
+    Separated from attrs_manifest.xml to keep upstream diffs minimal.
+    Referenced by R.styleable.AndroidManifestMcp* in McpManifestParser.
+
+    NOTE: This file must be compiled into the framework resource build
+    (frameworks/base/core/res/res/values/). AAPT will compile it alongside
+    the existing attrs_manifest.xml.
+
+    Attributes that already exist in AOSP (name, description, permission)
+    are referenced without format. New MCP-specific attributes use the
+    "mcp" prefix and declare their own format.
+-->
+<resources>
+
+    <!-- New global attr for MCP MIME type (not reusable from existing attrs
+         because android:mimeType is not declared as a standalone global attr
+         in all AOSP versions). -->
+    <attr name="mcpMimeType" format="string" />
+
+    <!-- Attributes for <mcp-server> element inside <application>. -->
+    <declare-styleable name="AndroidManifestMcpServer">
+        <!-- Fully qualified class name of the backing Service (required).
+             Relative names starting with "." are resolved against the package. -->
+        <attr name="name" />
+        <!-- Human-readable description of what this MCP server provides. -->
+        <attr name="description" />
+        <!-- Permission the LLM System Service must hold to bind. -->
+        <attr name="permission" />
+        <!-- MCP protocol version, e.g. "2024-11-05". -->
+        <attr name="mcpVersion" format="string" />
+    </declare-styleable>
+
+    <!-- Attributes for <tool> element inside <mcp-server>. -->
+    <declare-styleable name="AndroidManifestMcpTool">
+        <!-- Tool name, used as the function identifier in tool_call (required). -->
+        <attr name="name" />
+        <!-- Human-readable description for LLM context. -->
+        <attr name="description" />
+        <!-- Additional permission required to invoke this specific tool. -->
+        <attr name="permission" />
+        <!-- If true, the system must show a confirmation UI before executing. -->
+        <attr name="mcpRequiresConfirmation" format="boolean" />
+    </declare-styleable>
+
+    <!-- Attributes for <input> element inside <tool>. -->
+    <declare-styleable name="AndroidManifestMcpInput">
+        <!-- Parameter name, used as the JSON key in tool_call arguments (required). -->
+        <attr name="name" />
+        <!-- Human-readable description for LLM context. -->
+        <attr name="description" />
+        <!-- JSON Schema type for this parameter. -->
+        <attr name="mcpType" format="enum">
+            <enum name="string" value="0" />
+            <enum name="number" value="1" />
+            <enum name="integer" value="2" />
+            <enum name="boolean" value="3" />
+            <enum name="array" value="4" />
+            <enum name="object" value="5" />
+        </attr>
+        <!-- Whether this parameter is required. -->
+        <attr name="mcpRequired" format="boolean" />
+        <!-- Pipe-separated enum values, e.g. "draft|sent|archived". -->
+        <attr name="mcpEnumValues" format="string" />
+    </declare-styleable>
+
+    <!-- Attributes for <resource> element inside <mcp-server>. -->
+    <declare-styleable name="AndroidManifestMcpResource">
+        <!-- Resource name, used as the identifier in MCP resource reads (required). -->
+        <attr name="name" />
+        <!-- Content URI to read this resource (required). -->
+        <attr name="mcpUri" format="string" />
+        <!-- Human-readable description for LLM context. -->
+        <attr name="description" />
+        <!-- MIME type of the resource content. -->
+        <attr name="mcpMimeType" />
+        <!-- Additional permission required to read this resource. -->
+        <attr name="permission" />
+    </declare-styleable>
+
+</resources>

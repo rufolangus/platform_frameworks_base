@@ -2052,7 +2052,16 @@ public final class SystemServer implements Dumpable {
                     PackageManager.FEATURE_WIFI)) {
                 // Wifi Service must be started first for wifi-related services.
                 if (!isArc) {
-                    t.traceBegin("StartWifi");
+                    t.traceBegin("StartLlmService");
+            try {
+                mSystemServiceManager.startService(
+                        com.android.server.llm.LlmManagerService.class);
+            } catch (Throwable e) {
+                reportWtf("starting LLM Service", e);
+            }
+            t.traceEnd();
+
+            t.traceBegin("StartWifi");
                     mSystemServiceManager.startServiceFromJar(
                             WIFI_SERVICE_CLASS, WIFI_APEX_SERVICE_JAR_PATH);
                     t.traceEnd();

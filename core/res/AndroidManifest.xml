@@ -2721,6 +2721,14 @@
     <permission android:name="android.permission.MANAGE_USB"
         android:protectionLevel="signature|privileged" />
 
+    <!-- AAOSP: LLM System Service permissions -->
+    <permission android:name="android.permission.SUBMIT_LLM_REQUEST"
+        android:protectionLevel="signature|privileged" />
+
+    <permission android:name="android.permission.BIND_LLM_MCP_SERVICE"
+        android:protectionLevel="signature" />
+
+
     <!-- @SystemApi Allows an application to manage Android Debug Bridge settings.
          <p>Not for use by third-party applications.
          @hide -->

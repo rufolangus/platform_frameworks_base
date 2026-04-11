@@ -776,6 +776,17 @@ public final class SystemServiceRegistry {
                 return new UsbManager(ctx, IUsbManager.Stub.asInterface(b));
             }});
 
+        registerService(Context.LLM_SERVICE, android.llm.LlmManager.class,
+                new CachedServiceFetcher<android.llm.LlmManager>() {
+            @Override
+            public android.llm.LlmManager createService(ContextImpl ctx)
+                    throws ServiceNotFoundException {
+                IBinder b = ServiceManager.getServiceOrThrow(Context.LLM_SERVICE);
+                return new android.llm.LlmManager(
+                        android.llm.ILlmService.Stub.asInterface(b));
+            }});
+
+
         registerService(Context.ADB_SERVICE, AdbManager.class,
                 new CachedServiceFetcher<AdbManager>() {
                     @Override
