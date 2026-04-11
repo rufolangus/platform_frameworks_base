@@ -72,7 +72,6 @@ import java.util.concurrent.Executor;
  * });
  * }</pre>
  */
-@SystemService(Context.LLM_SERVICE)
 /** @hide */
 public class LlmManager {
 
