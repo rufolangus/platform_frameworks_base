@@ -42,6 +42,7 @@ import java.util.List;
  * </tool>
  * }</pre>
  */
+/** @hide */
 public final class McpToolInfo implements Parcelable {
 
     /** Tool name, used as the function identifier in MCP tool_call. */

@@ -75,11 +75,11 @@ import java.util.concurrent.Executor;
  * }</pre>
  */
 @SystemService(Context.LLM_SERVICE)
+/** @hide */
 public class LlmManager {
 
     private final ILlmService mService;
 
-    /** @hide */
     public LlmManager(ILlmService service) {
         mService = service;
     }

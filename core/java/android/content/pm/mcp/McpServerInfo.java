@@ -30,6 +30,7 @@ import java.util.List;
  * {@code <application>} in their {@code AndroidManifest.xml}. The system
  * parses these at install time and caches them in the MCP Tool Registry.
  */
+/** @hide */
 public final class McpServerInfo implements Parcelable {
 
     /** Fully qualified class name of the backing service. */

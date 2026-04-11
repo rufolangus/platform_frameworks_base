@@ -35,6 +35,7 @@ import java.util.List;
  *         .build();
  * }</pre>
  */
+/** @hide */
 public final class LlmRequest implements Parcelable {
 
     /** The user's prompt / message. */

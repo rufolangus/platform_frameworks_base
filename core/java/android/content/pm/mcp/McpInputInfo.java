@@ -38,9 +38,9 @@ import android.annotation.IntDef;
  *        android:description="Contact name or phone number" />
  * }</pre>
  */
+/** @hide */
 public final class McpInputInfo implements Parcelable {
 
-    /** @hide */
     @IntDef({TYPE_STRING, TYPE_NUMBER, TYPE_INTEGER, TYPE_BOOLEAN, TYPE_ARRAY, TYPE_OBJECT})
     @Retention(RetentionPolicy.SOURCE)
     public @interface InputType {}

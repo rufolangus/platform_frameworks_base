@@ -32,6 +32,7 @@ import android.os.Parcelable;
  *           android:mimeType="application/json" />
  * }</pre>
  */
+/** @hide */
 public final class McpResourceInfo implements Parcelable {
 
     /** Resource name, used as the identifier in MCP resource reads. */
