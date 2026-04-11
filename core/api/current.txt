@@ -40,7 +40,6 @@ package android {
     field public static final String BIND_DREAM_SERVICE = "android.permission.BIND_DREAM_SERVICE";
     field public static final String BIND_INCALL_SERVICE = "android.permission.BIND_INCALL_SERVICE";
     field public static final String BIND_INPUT_METHOD = "android.permission.BIND_INPUT_METHOD";
-    field public static final String BIND_LLM_MCP_SERVICE = "android.permission.BIND_LLM_MCP_SERVICE";
     field public static final String BIND_MIDI_DEVICE_SERVICE = "android.permission.BIND_MIDI_DEVICE_SERVICE";
     field public static final String BIND_NFC_SERVICE = "android.permission.BIND_NFC_SERVICE";
     field public static final String BIND_NOTIFICATION_LISTENER_SERVICE = "android.permission.BIND_NOTIFICATION_LISTENER_SERVICE";
@@ -307,7 +306,6 @@ package android {
     field public static final String START_VIEW_APP_FEATURES = "android.permission.START_VIEW_APP_FEATURES";
     field public static final String START_VIEW_PERMISSION_USAGE = "android.permission.START_VIEW_PERMISSION_USAGE";
     field public static final String STATUS_BAR = "android.permission.STATUS_BAR";
-    field public static final String SUBMIT_LLM_REQUEST = "android.permission.SUBMIT_LLM_REQUEST";
     field public static final String SUBSCRIBE_TO_KEYGUARD_LOCKED_STATE = "android.permission.SUBSCRIBE_TO_KEYGUARD_LOCKED_STATE";
     field public static final String SYSTEM_ALERT_WINDOW = "android.permission.SYSTEM_ALERT_WINDOW";
     field public static final String TRANSMIT_IR = "android.permission.TRANSMIT_IR";
@@ -20988,106 +20986,6 @@ package android.inputmethodservice {
     method @Deprecated public void swipeLeft();
     method @Deprecated public void swipeRight();
     method @Deprecated public void swipeUp();
-  }
-
-}
-
-package android.llm {
-
-  public interface ILlmResponseCallback extends android.os.IInterface {
-    method public void onComplete(String) throws android.os.RemoteException;
-    method public void onError(int, String) throws android.os.RemoteException;
-    method public void onServerUi(String) throws android.os.RemoteException;
-    method public void onToken(String) throws android.os.RemoteException;
-    method public void onToolCall(String, String) throws android.os.RemoteException;
-    method public void onToolResult(String, String) throws android.os.RemoteException;
-  }
-
-  public static class ILlmResponseCallback.Default implements android.llm.ILlmResponseCallback {
-    ctor public ILlmResponseCallback.Default();
-    method public android.os.IBinder asBinder();
-    method public void onComplete(String) throws android.os.RemoteException;
-    method public void onError(int, String) throws android.os.RemoteException;
-    method public void onServerUi(String) throws android.os.RemoteException;
-    method public void onToken(String) throws android.os.RemoteException;
-    method public void onToolCall(String, String) throws android.os.RemoteException;
-    method public void onToolResult(String, String) throws android.os.RemoteException;
-  }
-
-  public abstract static class ILlmResponseCallback.Stub extends android.os.Binder implements android.llm.ILlmResponseCallback {
-    ctor public ILlmResponseCallback.Stub();
-    method public android.os.IBinder asBinder();
-    method public static android.llm.ILlmResponseCallback asInterface(android.os.IBinder);
-    method public boolean onTransact(int, android.os.Parcel, android.os.Parcel, int) throws android.os.RemoteException;
-  }
-
-  public interface ILlmService extends android.os.IInterface {
-    method public void cancel(String) throws android.os.RemoteException;
-    method public java.util.List<android.content.pm.mcp.McpServerInfo> getAvailableServers() throws android.os.RemoteException;
-    method public String getModelInfo() throws android.os.RemoteException;
-    method public boolean isReady() throws android.os.RemoteException;
-    method public String submit(android.llm.LlmRequest, android.llm.ILlmResponseCallback) throws android.os.RemoteException;
-  }
-
-  public static class ILlmService.Default implements android.llm.ILlmService {
-    ctor public ILlmService.Default();
-    method public android.os.IBinder asBinder();
-    method public void cancel(String) throws android.os.RemoteException;
-    method public java.util.List<android.content.pm.mcp.McpServerInfo> getAvailableServers() throws android.os.RemoteException;
-    method public String getModelInfo() throws android.os.RemoteException;
-    method public boolean isReady() throws android.os.RemoteException;
-    method public String submit(android.llm.LlmRequest, android.llm.ILlmResponseCallback) throws android.os.RemoteException;
-  }
-
-  public abstract static class ILlmService.Stub extends android.os.Binder implements android.llm.ILlmService {
-    ctor public ILlmService.Stub();
-    method public android.os.IBinder asBinder();
-    method public static android.llm.ILlmService asInterface(android.os.IBinder);
-    method public boolean onTransact(int, android.os.Parcel, android.os.Parcel, int) throws android.os.RemoteException;
-  }
-
-  public interface IMcpToolProvider extends android.os.IInterface {
-    method public String invokeTool(String, String) throws android.os.RemoteException;
-    method public String listResources(String) throws android.os.RemoteException;
-    method public String readResource(String) throws android.os.RemoteException;
-  }
-
-  public static class IMcpToolProvider.Default implements android.llm.IMcpToolProvider {
-    ctor public IMcpToolProvider.Default();
-    method public android.os.IBinder asBinder();
-    method public String invokeTool(String, String) throws android.os.RemoteException;
-    method public String listResources(String) throws android.os.RemoteException;
-    method public String readResource(String) throws android.os.RemoteException;
-  }
-
-  public abstract static class IMcpToolProvider.Stub extends android.os.Binder implements android.llm.IMcpToolProvider {
-    ctor public IMcpToolProvider.Stub();
-    method public android.os.IBinder asBinder();
-    method public static android.llm.IMcpToolProvider asInterface(android.os.IBinder);
-    method public boolean onTransact(int, android.os.Parcel, android.os.Parcel, int) throws android.os.RemoteException;
-  }
-
-  public class LlmManager {
-    ctor public LlmManager(android.llm.ILlmService);
-    method @NonNull public java.util.List<android.content.pm.mcp.McpServerInfo> getAvailableServers();
-    method @Nullable public String getModelInfo();
-    method public boolean isReady();
-    method @NonNull public android.llm.LlmManager.Session submit(@NonNull android.llm.LlmRequest, @NonNull java.util.concurrent.Executor, @NonNull android.llm.LlmManager.Callback);
-  }
-
-  public abstract static class LlmManager.Callback {
-    ctor public LlmManager.Callback();
-    method public void onComplete(@NonNull String);
-    method public void onError(int, @NonNull String);
-    method public void onServerUi(@NonNull String);
-    method public void onToken(@NonNull String);
-    method public void onToolCall(@NonNull String, @NonNull String);
-    method public void onToolResult(@NonNull String, @NonNull String);
-  }
-
-  public static final class LlmManager.Session {
-    method public void cancel();
-    method @NonNull public String getId();
   }
 
 }

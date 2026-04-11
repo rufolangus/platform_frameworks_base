@@ -6,7 +6,6 @@
 package com.android.server.llm;
 
 import android.content.Context;
-import android.content.pm.mcp.McpServerInfo;
 import android.llm.ILlmResponseCallback;
 import android.llm.ILlmService;
 import android.llm.LlmRequest;
@@ -17,7 +16,6 @@ import android.util.Log;
 import com.android.server.SystemService;
 import com.android.server.pm.McpPackageHandler;
 
-import java.util.List;
 import java.util.UUID;
 
 /**
@@ -81,11 +79,18 @@ public class LlmManagerService extends SystemService {
         }
 
         @Override
-        public List<McpServerInfo> getAvailableServers() {
+        public String getAvailableServers() {
             mContext.enforceCallingOrSelfPermission(
                     "android.permission.SUBMIT_LLM_REQUEST",
                     "Must hold SUBMIT_LLM_REQUEST");
-            return McpPackageHandler.getRegistry().getAllServers();
+            // Return as JSON to avoid exposing MCP parcelables in public AIDL
+            java.util.List<android.content.pm.mcp.McpServerInfo> servers =
+                    McpPackageHandler.getRegistry().getAllServers();
+            org.json.JSONArray arr = new org.json.JSONArray();
+            for (android.content.pm.mcp.McpServerInfo s : servers) {
+                arr.put(s.toString());
+            }
+            return arr.toString();
         }
 
         @Override

@@ -5709,7 +5709,6 @@ public abstract class Context {
      * LLM System Service.
      *
      * @see #getSystemService(String)
-     * @hide
      */
     public static final String LLM_SERVICE = "llm";
 

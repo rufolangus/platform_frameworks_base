@@ -20,10 +20,8 @@ import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.annotation.SystemService;
 import android.content.Context;
-import android.content.pm.mcp.McpServerInfo;
 import android.os.RemoteException;
 
-import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.Executor;
 
@@ -108,10 +106,10 @@ public class LlmManager {
      * Get all MCP servers registered across installed apps.
      */
     @NonNull
-    public List<McpServerInfo> getAvailableServers() {
+    public String getAvailableServers() {
         try {
-            List<McpServerInfo> servers = mService.getAvailableServers();
-            return servers != null ? servers : Collections.emptyList();
+            String result = mService.getAvailableServers();
+            return result != null ? result : "[]";
         } catch (RemoteException e) {
             throw e.rethrowFromSystemServer();
         }
