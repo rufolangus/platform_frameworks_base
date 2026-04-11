@@ -45,6 +45,7 @@ public class LlmManagerService extends SystemService {
     @Override
     public void onBootPhase(int phase) {
         if (phase == SystemService.PHASE_SYSTEM_SERVICES_READY) {
+            McpPackageHandler.initialize();
             Log.i(TAG, "LLM System Service ready");
             // TODO: Initialize LlmModelConfig, LlmSessionStore,
             // McpConsentManager, load model via JNI
