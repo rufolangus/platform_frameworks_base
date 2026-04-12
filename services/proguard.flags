@@ -113,3 +113,9 @@
 # CoverageService guards optional jacoco class references with a runtime guard, so we can safely
 # suppress build-time warnings.
 -dontwarn org.jacoco.agent.rt.*
+
+# AAOSP: Keep JNI callback methods for llama.cpp inference
+-keep class com.android.server.llm.LlmManagerService$NativeTokenCallback {
+    *;
+}
+

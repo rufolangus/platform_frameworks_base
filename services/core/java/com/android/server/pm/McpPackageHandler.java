@@ -100,6 +100,9 @@ public class McpPackageHandler {
     public static void initialize() {
         sRegistry = new McpRegistry();
         Log.i(TAG, "MCP subsystem initialized");
+        // TODO: Scan installed packages for MCP services at boot
+        // For now, the registry starts empty and tools are discovered
+        // when the LLM service calls getAvailableServers()
     }
 
     /**

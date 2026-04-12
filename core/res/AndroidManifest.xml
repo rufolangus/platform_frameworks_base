@@ -2726,7 +2726,7 @@
         android:protectionLevel="signature|privileged" />
 
     <permission android:name="android.permission.BIND_LLM_MCP_SERVICE"
-        android:protectionLevel="signature" />
+        android:protectionLevel="signature|privileged" />
 
 
     <!-- @SystemApi Allows an application to manage Android Debug Bridge settings.

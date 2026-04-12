@@ -870,6 +870,13 @@ public class ParsingPackageUtils {
                     }
                     result = activityResult;
                     break;
+                case "mcp-server":
+                    // AAOSP: <mcp-server> is parsed by the LLM service at runtime
+                    // (com.android.server.pm.McpManifestParser). Skip the subtree
+                    // here so package parsing succeeds and sibling tags continue.
+                    XmlUtils.skipCurrentTag(parser);
+                    result = input.success(null);
+                    break;
                 case "service":
                     ParseResult<ParsedService> serviceResult = ParsedServiceUtils.parseService(
                             mSeparateProcesses, pkg, res, parser, flags, sUseRoundIcon,
@@ -2293,8 +2300,11 @@ public class ParsingPackageUtils {
                     result = systemServiceResult;
                     break;
                 case "mcp-server":
-                    // AAOSP: Parse MCP server declarations
-                    result = input.success(pkg);
+                    // AAOSP: <mcp-server> is parsed by the LLM service at runtime
+                    // (com.android.server.pm.McpManifestParser). Skip subtree here
+                    // so package parsing succeeds and sibling tags continue.
+                    XmlUtils.skipCurrentTag(parser);
+                    result = input.success(null);
                     break;
                 default:
                     result = parseBaseAppChildTag(input, tagName, pkg, res, parser, flags);

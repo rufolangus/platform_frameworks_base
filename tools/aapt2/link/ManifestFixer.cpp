@@ -640,6 +640,11 @@ bool ManifestFixer::BuildRules(xml::XmlActionExecutor* executor, android::IDiagn
   application_action["processes"]["process"]["deny-permission"];
   application_action["processes"]["process"]["allow-permission"];
 
+  // AAOSP: MCP server declarations
+  xml::XmlNodeAction& mcp_server_action = application_action["mcp-server"];
+  mcp_server_action["tool"]["input"];
+  mcp_server_action["resource"];
+
   application_action["activity"] = component_action;
   application_action["activity"]["layout"];
 
