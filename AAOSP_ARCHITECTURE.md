@@ -167,15 +167,78 @@ adb shell logcat -d -s LlmManagerService LlmJNI McpManifestParser
 4. On boot, `LlmManagerService.discoverMcpServices()` will pick it up at
    `PHASE_BOOT_COMPLETED` and register tools in `McpRegistry`.
 
-## Known gaps / TODO
+## Current state (2026-04-12)
+
+End-to-end **LLM** path is verified working:
+- `libllm_jni.so` loads in `system_server`
+- Qwen 2.5 0.5B model loads (`vocab=151936, ctx=2048`)
+- `service llm: found` — binder API is live
+
+End-to-end **MCP** path is **not yet verified**:
+- `discoverMcpServices()` runs at `PHASE_BOOT_COMPLETED` and reports
+  `0 package(s), 0 tool(s)`.
+- `ContactsMcp` is installed (`pm list packages` shows it) and its APK
+  manifest is correct (`<service>` + `<mcp-server>` both present after
+  reorder, both with `BIND_LLM_MCP_SERVICE` permission).
+- `dumpsys package com.android.contacts.mcp` shows **no Service entries**
+  — PMS is silently dropping the `<service>` declaration during scan.
+- Protection-level fix in source (`signature` → `signature|privileged`)
+  has not yet propagated into the running `framework-res.apk` due to
+  Soong incremental cache. Currently mid-rebuild after `rm -rf` of
+  `out/soong/.intermediates/frameworks/base/{core/res,framework-res}`.
+
+## Known gotchas (learned the hard way)
+
+- **`adb install -r -d` of a system app creates a `/data/app/` override**
+  that supersedes the `/system_ext/priv-app/` version. Sideloaded APKs
+  are signed with the dev/debug key, NOT platform — so any `<service>`
+  guarded by a `signature`-protected permission silently fails to
+  register. Workaround: `adb uninstall <pkg>` to revert to the system
+  version, or never sideload system apps for testing — `make` and
+  relaunch instead.
+- **`adb reboot` on Cuttlefish doesn't actually restart the VM**. The
+  guest kernel goes down, crosvm stays up, init never re-runs. Always
+  use `stop_cvd && launch_cvd` for a real cycle.
+- **`launch_cvd` wipes `/data`**. Lib + model push (`/data/local/llm/`)
+  must come *after* the final `launch_cvd`, not before any subsequent
+  one — otherwise the new boot crash-loops on `UnsatisfiedLinkError`
+  in `LlmManagerService.loadModel()` and RescueParty stalls boot.
+- **Incremental `m systemimage` is a trap when `boot.img`/`vbmeta.img`
+  haven't been rebuilt** — dm-verity hashes mismatch, device boots into
+  recovery. Always full `m -j32`.
+- **Soong incremental cache serves stale outputs** even after source
+  edits, especially for `framework.jar` and resource APKs. Symptoms:
+  identical md5 across rebuilds despite confirmed source changes.
+  Workaround: `rm -rf out/soong/.intermediates/<module>` for the
+  affected module, then `m -j32 <module>`.
+
+## Repo push state (2026-04-12)
+
+| Repo | Fork | Pushed |
+|------|------|--------|
+| `frameworks/base` | rufolangus/platform_frameworks_base | ✅ aaosp-v15 |
+| `external/llama.cpp` | rufolangus/platform_external_llamacpp | ✅ main |
+| `packages/apps/AgenticLauncher` | rufolangus/platform_packages_apps_AgenticLauncher | ✅ main |
+| `packages/apps/ContactsMcp` | rufolangus/platform_packages_apps_ContactsMcp | ✅ main (initial commit) |
+| `build/make` | rufolangus/aaosp_platform_build | ✅ aaosp |
+| `system/sepolicy` | rufolangus/aaosp_system_sepolicy | ❌ pack too large for first push |
+| `device/google/cuttlefish` | rufolangus/aaosp_device_google_cuttlefish | ❌ pack too large for first push |
+
+Two failures are pack-size limits on github (full AOSP history). Options:
+`git gc --aggressive --prune=now` then retry, or push as orphan branch
+with snapshot only (loses upstream linkage on github but preserves
+locally), or move to the `repo manifest + local_manifests/` overlay
+pattern that LineageOS/GrapheneOS use (pull AOSP from googlesource,
+overlay only the changed projects from github).
+
+## Other known gaps / TODO
 
 - `libllm_jni.so` install path → ship in `/system/lib64` not `/data/local/`.
 - `qwen2.5-0.5b.gguf` ships as a runtime push, not yet baked into a system
   partition (size considerations).
 - `dumpsys llm` segfaults — needs proper `dump()` impl.
-- `McpManifestParser` is wired but currently bypassed by hardcoded fallback
-  in `LlmManagerService.discoverMcpServices()` for the contacts package.
+- `McpManifestParser` is wired in `LlmManagerService.parseManifestMcpServers()`
+  but cannot demonstrate end-to-end until the `<service>` registration
+  issue above is resolved.
 - No human-in-the-loop consent UI yet for tool invocations.
 - `LlmSessionStore` (SQLite session persistence) scaffolded but not wired.
-- Soong incremental cache occasionally serves stale `framework.jar` after
-  source edits; full `m -j32` is the workaround.
