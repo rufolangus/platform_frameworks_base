@@ -17,6 +17,7 @@ import android.content.pm.mcp.McpToolInfo;
 import android.os.Binder;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.IBinder;
 import android.os.RemoteException;
 import android.util.Log;
 
@@ -118,7 +119,31 @@ public class LlmManagerService extends SystemService {
         // Scan for packages that declare a service gated by BIND_LLM_MCP_SERVICE,
         // then parse their AndroidManifest.xml for <mcp-server> / <tool> declarations.
         java.util.List<android.content.pm.PackageInfo> packages =
-                pm.getInstalledPackages(PackageManager.GET_SERVICES);
+                pm.getInstalledPackages(PackageManager.GET_SERVICES
+                        | PackageManager.MATCH_DISABLED_COMPONENTS
+                        | PackageManager.MATCH_DIRECT_BOOT_AWARE
+                        | PackageManager.MATCH_DIRECT_BOOT_UNAWARE);
+
+        Log.i(TAG, "MCP scan: total packages with GET_SERVICES = " + packages.size());
+        int withServices = 0, contactsSeen = 0;
+        for (android.content.pm.PackageInfo pkg : packages) {
+            if (pkg.services != null && pkg.services.length > 0) withServices++;
+            if (pkg.packageName != null && pkg.packageName.contains("contacts.mcp")) {
+                contactsSeen++;
+                Log.i(TAG, "MCP scan: SAW " + pkg.packageName + " services="
+                        + (pkg.services == null ? "null"
+                                : ("len=" + pkg.services.length)));
+                if (pkg.services != null) {
+                    for (ServiceInfo svc : pkg.services) {
+                        Log.i(TAG, "MCP scan:   svc " + svc.name
+                                + " perm=" + svc.permission
+                                + " exported=" + svc.exported);
+                    }
+                }
+            }
+        }
+        Log.i(TAG, "MCP scan: " + withServices + " pkgs have services, "
+                + contactsSeen + " contacts.mcp matches");
 
         int toolCount = 0;
         int pkgCount = 0;
@@ -132,6 +157,7 @@ public class LlmManagerService extends SystemService {
                 }
             }
             if (!hasMcpService) continue;
+            Log.i(TAG, "MCP scan: candidate " + pkg.packageName);
 
             java.util.List<McpServerInfo> servers = parseManifestMcpServers(pm, pkg.packageName);
             if (servers.isEmpty()) {
@@ -223,17 +249,38 @@ public class LlmManagerService extends SystemService {
             mInferenceHandler.post(() -> {
                 try {
                     String prompt = buildPrompt(request);
-                    Log.i(TAG, "Generating for prompt: " + prompt.substring(0, Math.min(100, prompt.length())));
+                    Log.i(TAG, "Generating for prompt: " + prompt.substring(0, Math.min(200, prompt.length())));
 
+                    NativeTokenCallback ntc = new NativeTokenCallback(callback);
                     String result = nativeGenerate(
                             mNativeModelPtr,
                             prompt,
                             request.maxTokens > 0 ? request.maxTokens : 256,
                             request.temperature,
-                            new NativeTokenCallback(callback));
+                            ntc);
 
-                    callback.onComplete(result);
-                    Log.i(TAG, "Generation complete: " + result.length() + " chars");
+                    Log.i(TAG, "Raw LLM output: " + result);
+
+                    // Detect and dispatch tool call(s) in Qwen <tool_call>...</tool_call> format.
+                    String toolResult = maybeExecuteToolCall(result);
+                    if (toolResult != null) {
+                        // Tool ran. Build a clean response: prose before <tool_call>
+                        // + the human-readable tool result. <tool_call>...</tool_call>
+                        // and any trailing prose are discarded for the UI.
+                        String pretext = result;
+                        int callIdx = result.indexOf("<tool_call>");
+                        if (callIdx >= 0) pretext = result.substring(0, callIdx).trim();
+                        String humanized = humanizeToolResult(toolResult);
+                        String clean = (pretext.isEmpty() ? "" : pretext + "\n\n") + humanized;
+                        try { callback.onToken(humanized); } catch (RemoteException re) {}
+                        callback.onComplete(clean);
+                        Log.i(TAG, "Generation+tool complete: " + clean.length() + " chars");
+                    } else {
+                        // No tool call — flush any held-back tail and complete.
+                        ntc.flushSafely();
+                        callback.onComplete(result);
+                        Log.i(TAG, "Generation complete: " + result.length() + " chars");
+                    }
                 } catch (Exception e) {
                     Log.e(TAG, "Inference error", e);
                     try {
@@ -280,6 +327,11 @@ public class LlmManagerService extends SystemService {
         } else {
             sb.append("You are a helpful AI assistant running on Android.");
         }
+        // Inject MCP tool definitions (Qwen 2.5 tool-use format).
+        String toolsBlock = buildToolsBlock();
+        if (toolsBlock != null) {
+            sb.append("\n\n").append(toolsBlock);
+        }
         sb.append("\n<|im_end|>\n");
         sb.append("<|im_start|>user\n");
         sb.append(request.prompt);
@@ -288,15 +340,257 @@ public class LlmManagerService extends SystemService {
         return sb.toString();
     }
 
+    /**
+     * Build the tools block in Qwen 2.5's expected format. Returns null if
+     * no MCP servers are registered.
+     */
+    private String buildToolsBlock() {
+        java.util.List<McpServerInfo> allServers =
+                McpPackageHandler.getRegistry().getAllServers();
+        java.util.List<McpToolInfo> tools = new java.util.ArrayList<>();
+        java.util.Map<String, String> toolToPackage = new java.util.HashMap<>();
+        java.util.Map<String, String> toolToService = new java.util.HashMap<>();
+        for (McpServerInfo s : allServers) {
+            if (s.tools == null) continue;
+            for (McpToolInfo t : s.tools) {
+                tools.add(t);
+                toolToPackage.put(t.name, s.packageName);
+                toolToService.put(t.name, s.name);
+            }
+        }
+        if (tools.isEmpty()) return null;
+
+        // Cache the routing tables so the dispatcher can find the service later.
+        synchronized (mToolRouteLock) {
+            mToolToPackage = toolToPackage;
+            mToolToService = toolToService;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("# Tools\n\n");
+        sb.append("You may call one or more functions to assist with the user query.\n\n");
+        sb.append("You are provided with function signatures within <tools></tools> XML tags:\n");
+        sb.append("<tools>\n");
+        for (McpToolInfo t : tools) {
+            sb.append("{\"type\":\"function\",\"function\":{");
+            sb.append("\"name\":\"").append(jsonEscape(t.name)).append("\",");
+            sb.append("\"description\":\"").append(jsonEscape(
+                    t.description == null ? "" : t.description)).append("\",");
+            sb.append("\"parameters\":{\"type\":\"object\",\"properties\":{");
+            if (t.inputs != null) {
+                boolean first = true;
+                for (android.content.pm.mcp.McpInputInfo in : t.inputs) {
+                    if (!first) sb.append(",");
+                    sb.append("\"").append(jsonEscape(in.name)).append("\":{");
+                    sb.append("\"type\":\"string\",");
+                    sb.append("\"description\":\"").append(jsonEscape(
+                            in.description == null ? "" : in.description)).append("\"}");
+                    first = false;
+                }
+            }
+            sb.append("},\"required\":[");
+            if (t.inputs != null) {
+                boolean first = true;
+                for (android.content.pm.mcp.McpInputInfo in : t.inputs) {
+                    if (in.required) {
+                        if (!first) sb.append(",");
+                        sb.append("\"").append(jsonEscape(in.name)).append("\"");
+                        first = false;
+                    }
+                }
+            }
+            sb.append("]}}}\n");
+        }
+        sb.append("</tools>\n\n");
+        sb.append("For each function call, return a json object with function name and ");
+        sb.append("arguments within <tool_call></tool_call> XML tags:\n");
+        sb.append("<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>");
+        return sb.toString();
+    }
+
+    private static String jsonEscape(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\").replace("\"", "\\\"")
+                .replace("\n", "\\n").replace("\r", "");
+    }
+
+    private final Object mToolRouteLock = new Object();
+    private java.util.Map<String, String> mToolToPackage = new java.util.HashMap<>();
+    private java.util.Map<String, String> mToolToService = new java.util.HashMap<>();
+
+    /**
+     * If the LLM output contains a <tool_call>{"name":..., "arguments":...}</tool_call>,
+     * bind to the owning MCP service via {@link android.llm.IMcpToolProvider} and invoke
+     * the tool. Returns the tool result text, or null if no tool call was present
+     * or dispatch failed.
+     */
+    private String maybeExecuteToolCall(String llmOutput) {
+        if (llmOutput == null) return null;
+        int start = llmOutput.indexOf("<tool_call>");
+        if (start < 0) return null;
+        int end = llmOutput.indexOf("</tool_call>", start);
+        if (end < 0) return null;
+        String body = llmOutput.substring(start + "<tool_call>".length(), end).trim();
+        try {
+            org.json.JSONObject obj = new org.json.JSONObject(body);
+            String name = obj.optString("name", null);
+            org.json.JSONObject args = obj.optJSONObject("arguments");
+            if (name == null) {
+                Log.w(TAG, "tool_call missing name: " + body);
+                return null;
+            }
+            String pkgName, svcName;
+            synchronized (mToolRouteLock) {
+                pkgName = mToolToPackage.get(name);
+                svcName = mToolToService.get(name);
+            }
+            if (pkgName == null || svcName == null) {
+                Log.w(TAG, "tool_call for unknown tool: " + name);
+                return "{\"error\":\"unknown tool: " + name + "\"}";
+            }
+            Log.i(TAG, "Dispatching tool " + name + " -> " + pkgName + "/" + svcName);
+            return invokeMcpTool(pkgName, svcName, name,
+                    args == null ? "{}" : args.toString());
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to parse tool_call: " + body, e);
+            return null;
+        }
+    }
+
+    /**
+     * Best-effort pretty-print of a tool's JSON result. If it parses as a JSON
+     * array of objects we render rows; if it's an object we render key:value
+     * lines; on error and a Java exception JSON we surface a friendly error;
+     * otherwise we return the raw text.
+     */
+    private static String humanizeToolResult(String json) {
+        if (json == null) return "(no result)";
+        String s = json.trim();
+        try {
+            if (s.startsWith("[")) {
+                org.json.JSONArray arr = new org.json.JSONArray(s);
+                if (arr.length() == 0) return "(no results)";
+                StringBuilder out = new StringBuilder();
+                for (int i = 0; i < arr.length(); i++) {
+                    if (i > 0) out.append("\n");
+                    Object item = arr.get(i);
+                    if (item instanceof org.json.JSONObject) {
+                        org.json.JSONObject o = (org.json.JSONObject) item;
+                        boolean first = true;
+                        java.util.Iterator<String> keys = o.keys();
+                        while (keys.hasNext()) {
+                            String k = keys.next();
+                            if (!first) out.append(" · ");
+                            out.append(o.optString(k, ""));
+                            first = false;
+                        }
+                    } else {
+                        out.append(item.toString());
+                    }
+                }
+                return out.toString();
+            }
+            if (s.startsWith("{")) {
+                org.json.JSONObject o = new org.json.JSONObject(s);
+                if (o.has("error")) return "Error: " + o.optString("error");
+                StringBuilder out = new StringBuilder();
+                java.util.Iterator<String> keys = o.keys();
+                while (keys.hasNext()) {
+                    String k = keys.next();
+                    out.append(k).append(": ").append(o.optString(k, "")).append("\n");
+                }
+                return out.toString().trim();
+            }
+        } catch (Exception ignored) {}
+        return s;
+    }
+
+    private String invokeMcpTool(String pkgName, String svcName,
+            String toolName, String argsJson) {
+        Intent intent = new Intent();
+        intent.setClassName(pkgName, svcName);
+        final java.util.concurrent.CountDownLatch latch =
+                new java.util.concurrent.CountDownLatch(1);
+        final String[] result = new String[1];
+        final android.content.ServiceConnection conn = new android.content.ServiceConnection() {
+            @Override
+            public void onServiceConnected(android.content.ComponentName name,
+                    IBinder service) {
+                try {
+                    android.llm.IMcpToolProvider provider =
+                            android.llm.IMcpToolProvider.Stub.asInterface(service);
+                    result[0] = provider.invokeTool(toolName, argsJson);
+                } catch (Exception e) {
+                    result[0] = "{\"error\":\"" + jsonEscape(e.toString()) + "\"}";
+                } finally {
+                    latch.countDown();
+                }
+            }
+            @Override public void onServiceDisconnected(android.content.ComponentName name) {}
+        };
+        try {
+            boolean bound = mContext.bindService(intent, conn,
+                    android.content.Context.BIND_AUTO_CREATE);
+            if (!bound) {
+                return "{\"error\":\"bind failed for " + pkgName + "/" + svcName + "\"}";
+            }
+            if (!latch.await(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                return "{\"error\":\"tool timeout\"}";
+            }
+            return result[0] != null ? result[0] : "{\"error\":\"null result\"}";
+        } catch (Exception e) {
+            return "{\"error\":\"" + jsonEscape(e.toString()) + "\"}";
+        } finally {
+            try { mContext.unbindService(conn); } catch (Exception ignored) {}
+        }
+    }
+
     public static class NativeTokenCallback {
         private final ILlmResponseCallback mCallback;
+        // Buffer everything we've seen so far; only forward to the client up to
+        // mForwardedLen. Once we observe "<tool_call>" we stop forwarding so the
+        // raw tag/JSON never reaches the UI; the dispatcher emits a clean result
+        // afterward.
+        private final StringBuilder mBuffer = new StringBuilder();
+        private int mForwardedLen = 0;
+        private boolean mSuppressing = false;
         public NativeTokenCallback(ILlmResponseCallback callback) {
             mCallback = callback;
         }
         @SuppressWarnings("unused")
         public void onToken(String token) {
-            try { mCallback.onToken(token); }
-            catch (RemoteException e) {}
+            if (token == null) return;
+            mBuffer.append(token);
+            if (mSuppressing) return;
+            String buf = mBuffer.toString();
+            int callIdx = buf.indexOf("<tool_call>", mForwardedLen);
+            if (callIdx >= 0) {
+                String safe = buf.substring(mForwardedLen, callIdx);
+                if (!safe.isEmpty()) {
+                    try { mCallback.onToken(safe); } catch (RemoteException e) {}
+                }
+                mForwardedLen = buf.length();
+                mSuppressing = true;
+                return;
+            }
+            // Hold back the trailing 11 chars in case we're mid "<tool_call" so we
+            // never forward a partial tag.
+            int safeUpTo = Math.max(mForwardedLen, buf.length() - 11);
+            if (safeUpTo > mForwardedLen) {
+                String chunk = buf.substring(mForwardedLen, safeUpTo);
+                try { mCallback.onToken(chunk); } catch (RemoteException e) {}
+                mForwardedLen = safeUpTo;
+            }
+        }
+        /** Flush any held-back tail (no tool_call seen). */
+        void flushSafely() {
+            if (mSuppressing) return;
+            String buf = mBuffer.toString();
+            if (mForwardedLen < buf.length()) {
+                try { mCallback.onToken(buf.substring(mForwardedLen)); }
+                catch (RemoteException e) {}
+                mForwardedLen = buf.length();
+            }
         }
         @SuppressWarnings("unused")
         public boolean isCancelled() { return false; }
