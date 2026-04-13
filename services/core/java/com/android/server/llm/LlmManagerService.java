@@ -31,8 +31,16 @@ public class LlmManagerService extends SystemService {
 
     private static final String TAG = "LlmManagerService";
     private static final String SERVICE_NAME = "llm";
-    private static final String MODEL_DIR = "/data/local/llm";
-    private static final String SYSTEM_MODEL_DIR = "/system/etc/llm";
+    // Model search path, in priority order. /product/etc/llm is the
+    // canonical location populated by aaosp_platform_build's
+    // PRODUCT_COPY_FILES rule (Qwen 2.5 GGUF baked into the image).
+    // /system/etc/llm is a legacy fallback. /data/local/llm is the dev
+    // override — anything pushed there via `adb push` wins for testing.
+    private static final String[] MODEL_SEARCH_DIRS = {
+            "/data/local/llm",
+            "/product/etc/llm",
+            "/system/etc/llm",
+    };
 
     private final Context mContext;
     private HandlerThread mInferenceThread;
@@ -76,7 +84,8 @@ public class LlmManagerService extends SystemService {
         // Find model file
         mModelPath = findModel();
         if (mModelPath == null) {
-            Log.w(TAG, "No model file found in " + MODEL_DIR + " or " + SYSTEM_MODEL_DIR);
+            Log.w(TAG, "No .gguf model file found in any of: "
+                    + java.util.Arrays.toString(MODEL_SEARCH_DIRS));
             return;
         }
 
@@ -94,19 +103,12 @@ public class LlmManagerService extends SystemService {
     }
 
     private String findModel() {
-        // Check data partition first
-        File dir = new File(MODEL_DIR);
-        if (dir.exists()) {
+        for (String path : MODEL_SEARCH_DIRS) {
+            File dir = new File(path);
+            if (!dir.exists()) continue;
             File[] files = dir.listFiles((d, name) -> name.endsWith(".gguf"));
             if (files != null && files.length > 0) {
-                return files[0].getAbsolutePath();
-            }
-        }
-        // Check system partition
-        dir = new File(SYSTEM_MODEL_DIR);
-        if (dir.exists()) {
-            File[] files = dir.listFiles((d, name) -> name.endsWith(".gguf"));
-            if (files != null && files.length > 0) {
+                Log.i(TAG, "Found model: " + files[0].getAbsolutePath());
                 return files[0].getAbsolutePath();
             }
         }
@@ -240,7 +242,7 @@ public class LlmManagerService extends SystemService {
 
             if (mNativeModelPtr == 0) {
                 try {
-                    callback.onError(1, "Model not loaded. Push a .gguf file to /data/local/llm/");
+                    callback.onError(1, "Model not loaded. Bake a .gguf into /product/etc/llm at build time or push to /data/local/llm at runtime.");
                 } catch (RemoteException e) {}
                 return sessionId;
             }
@@ -264,20 +266,30 @@ public class LlmManagerService extends SystemService {
                     // Detect and dispatch tool call(s) in Qwen <tool_call>...</tool_call> format.
                     String toolResult = maybeExecuteToolCall(result);
                     if (toolResult != null) {
-                        // Tool ran. Build a clean response: prose before <tool_call>
-                        // + the human-readable tool result. <tool_call>...</tool_call>
-                        // and any trailing prose are discarded for the UI.
-                        String pretext = result;
-                        int callIdx = result.indexOf("<tool_call>");
-                        if (callIdx >= 0) pretext = result.substring(0, callIdx).trim();
-                        String humanized = humanizeToolResult(toolResult);
-                        String clean = (pretext.isEmpty() ? "" : pretext + "\n\n") + humanized;
-                        try { callback.onToken(humanized); } catch (RemoteException re) {}
+                        // Tool ran. Round 2: feed the tool result back to the LLM
+                        // and let it generate a natural-language final answer.
+                        String continuation = buildContinuationPrompt(
+                                request, result, toolResult);
+                        Log.i(TAG, "Round-2 continuation prompt: "
+                                + continuation.substring(0,
+                                        Math.min(200, continuation.length())));
+                        NativeTokenCallback ntc2 = new NativeTokenCallback(callback);
+                        String finalAnswer = nativeGenerate(
+                                mNativeModelPtr,
+                                continuation,
+                                request.maxTokens > 0 ? request.maxTokens : 256,
+                                request.temperature,
+                                ntc2);
+                        // Strip any stray <tool_call> the model might emit again,
+                        // and any chat-format remnants.
+                        String clean = stripChatRemnants(finalAnswer);
+                        try { callback.onToken(clean); } catch (RemoteException re) {}
                         callback.onComplete(clean);
-                        Log.i(TAG, "Generation+tool complete: " + clean.length() + " chars");
+                        Log.i(TAG, "Generation+tool+round2 complete: "
+                                + clean.length() + " chars");
                     } else {
-                        // No tool call — flush any held-back tail and complete.
-                        ntc.flushSafely();
+                        // No tool call — emit the raw buffer as-is.
+                        ntc.emitBuffer();
                         callback.onComplete(result);
                         Log.i(TAG, "Generation complete: " + result.length() + " chars");
                     }
@@ -313,7 +325,7 @@ public class LlmManagerService extends SystemService {
         @Override
         public String getModelInfo() {
             if (mNativeModelPtr == 0) {
-                return "No model loaded. Push .gguf to /data/local/llm/";
+                return "No model loaded. Bake .gguf into /product/etc/llm or push to /data/local/llm.";
             }
             return nativeGetModelInfo(mNativeModelPtr);
         }
@@ -463,6 +475,66 @@ public class LlmManagerService extends SystemService {
      * lines; on error and a Java exception JSON we surface a friendly error;
      * otherwise we return the raw text.
      */
+    /**
+     * Build the "round 2" prompt that tells the LLM what tool was just called,
+     * what the result was, and asks it to produce a natural-language answer.
+     * This is the standard agentic loop: user → assistant tool_call →
+     * tool_response → assistant final answer.
+     */
+    private String buildContinuationPrompt(LlmRequest request,
+            String firstRoundOutput, String toolResultJson) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("<|im_start|>system\n");
+        if (request.systemPrompt != null) {
+            sb.append(request.systemPrompt);
+        } else {
+            sb.append("You are a helpful AI assistant running on Android. ");
+            sb.append("The tool_response below contains the actual data the user is ");
+            sb.append("asking for. You MUST show every field of every entry to the ");
+            sb.append("user. Do NOT just say \"I found N results\" — show what they ");
+            sb.append("are: name, phone, email, every value present. Do not omit, ");
+            sb.append("hide, or summarize the data. Briefly mention which tool you ");
+            sb.append("used at the start (e.g. \"I searched your contacts:\"), then ");
+            sb.append("list the data as a bulleted list (one bullet per entry, ");
+            sb.append("fields separated by commas).");
+        }
+        String toolsBlock = buildToolsBlock();
+        if (toolsBlock != null) sb.append("\n\n").append(toolsBlock);
+        sb.append("\n<|im_end|>\n");
+        sb.append("<|im_start|>user\n").append(request.prompt).append("\n<|im_end|>\n");
+        // Include just the tool_call line from the first round so the model has
+        // context for what it asked.
+        String toolCallLine = "";
+        int s = firstRoundOutput.indexOf("<tool_call>");
+        int e = firstRoundOutput.indexOf("</tool_call>", s);
+        if (s >= 0 && e > s) {
+            toolCallLine = firstRoundOutput.substring(s, e + "</tool_call>".length());
+        }
+        sb.append("<|im_start|>assistant\n").append(toolCallLine).append("\n<|im_end|>\n");
+        sb.append("<|im_start|>user\n<tool_response>\n");
+        sb.append(toolResultJson);
+        sb.append("\n</tool_response>\n\n");
+        sb.append("Using this data, answer my original question: \"");
+        sb.append(request.prompt);
+        sb.append("\"\n<|im_end|>\n");
+        sb.append("<|im_start|>assistant\n");
+        return sb.toString();
+    }
+
+    /** Belt-and-suspenders cleaning of any chat tokens the model might leak. */
+    private static String stripChatRemnants(String s) {
+        if (s == null) return "";
+        // Drop any second tool_call attempt
+        int tc = s.indexOf("<tool_call>");
+        if (tc >= 0) s = s.substring(0, tc);
+        // Drop chat tokens
+        s = s.replace("<|im_start|>", "")
+             .replace("<|im_end|>", "")
+             .replace("assistant\n", "")
+             .replace("user\n", "");
+        return s.trim();
+    }
+
     private static String humanizeToolResult(String json) {
         if (json == null) return "(no result)";
         String s = json.trim();
@@ -546,54 +618,25 @@ public class LlmManagerService extends SystemService {
     }
 
     public static class NativeTokenCallback {
+        // Pure buffer — never forwards intermediate tokens to the launcher.
+        // The dispatcher decides what the user actually sees and emits the
+        // clean final response via onToken + onComplete after generation.
         private final ILlmResponseCallback mCallback;
-        // Buffer everything we've seen so far; only forward to the client up to
-        // mForwardedLen. Once we observe "<tool_call>" we stop forwarding so the
-        // raw tag/JSON never reaches the UI; the dispatcher emits a clean result
-        // afterward.
         private final StringBuilder mBuffer = new StringBuilder();
-        private int mForwardedLen = 0;
-        private boolean mSuppressing = false;
         public NativeTokenCallback(ILlmResponseCallback callback) {
             mCallback = callback;
         }
         @SuppressWarnings("unused")
         public void onToken(String token) {
-            if (token == null) return;
-            mBuffer.append(token);
-            if (mSuppressing) return;
-            String buf = mBuffer.toString();
-            int callIdx = buf.indexOf("<tool_call>", mForwardedLen);
-            if (callIdx >= 0) {
-                String safe = buf.substring(mForwardedLen, callIdx);
-                if (!safe.isEmpty()) {
-                    try { mCallback.onToken(safe); } catch (RemoteException e) {}
-                }
-                mForwardedLen = buf.length();
-                mSuppressing = true;
-                return;
-            }
-            // Hold back the trailing 11 chars in case we're mid "<tool_call" so we
-            // never forward a partial tag.
-            int safeUpTo = Math.max(mForwardedLen, buf.length() - 11);
-            if (safeUpTo > mForwardedLen) {
-                String chunk = buf.substring(mForwardedLen, safeUpTo);
-                try { mCallback.onToken(chunk); } catch (RemoteException e) {}
-                mForwardedLen = safeUpTo;
-            }
-        }
-        /** Flush any held-back tail (no tool_call seen). */
-        void flushSafely() {
-            if (mSuppressing) return;
-            String buf = mBuffer.toString();
-            if (mForwardedLen < buf.length()) {
-                try { mCallback.onToken(buf.substring(mForwardedLen)); }
-                catch (RemoteException e) {}
-                mForwardedLen = buf.length();
-            }
+            if (token != null) mBuffer.append(token);
         }
         @SuppressWarnings("unused")
         public boolean isCancelled() { return false; }
+        /** Send the held buffer verbatim — used when there's no tool_call. */
+        void emitBuffer() {
+            try { mCallback.onToken(mBuffer.toString()); }
+            catch (RemoteException e) {}
+        }
     }
 
     static {
