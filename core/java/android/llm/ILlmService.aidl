@@ -30,9 +30,9 @@ interface ILlmService {
 
     /**
      * Revoke a previously persisted consent grant. Next call to the same
-     * (package, tool) re-prompts the user. Used by the (forthcoming v0.5)
-     * Settings → AI → Tool Access surface; v0.4 exposes it via
-     * `cmd llm revoke <pkg> <tool>` for testing.
+     * (package, tool) re-prompts the user. Intended for a future Settings →
+     * AI → Tool Access surface; reachable today via `cmd llm revoke <pkg>
+     * <tool>` for testing.
      */
     void revokeToolGrant(String packageName, String toolName);
 
