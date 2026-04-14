@@ -71,6 +71,8 @@ public class LlmManagerService extends SystemService {
     private HandlerThread mInferenceThread;
     private Handler mInferenceHandler;
     private volatile long mNativeModelPtr = 0;
+    /** llama.cpp context size the model was loaded with, in tokens. Set by loadModel(). */
+    private volatile int mNativeModelCtxSize = 0;
     private String mModelPath;
 
     // v0.4: HITL consent + audit log
@@ -147,7 +149,8 @@ public class LlmManagerService extends SystemService {
             // threads 4 → 8 to take advantage of Cuttlefish --cpus=16;
             // on a phone this should match the number of big cores (~6-8
             // on a modern flagship). No effect on model quality.
-            mNativeModelPtr = nativeLoadModel(mModelPath, 4096, 0, 8);
+            mNativeModelCtxSize = 4096;
+            mNativeModelPtr = nativeLoadModel(mModelPath, mNativeModelCtxSize, 0, 8);
             if (mNativeModelPtr != 0) {
                 Log.i(TAG, "Model loaded: " + nativeGetModelInfo(mNativeModelPtr));
             } else {
@@ -475,6 +478,39 @@ public class LlmManagerService extends SystemService {
             }
             pw.println("    " + TOOL_LAUNCH_APP + " → " + BUILTIN_PKG
                     + " [builtin]");
+            // v0.5.1: prompt-size rolling histogram so we can decide if
+            // context compaction / tool-result clearing are real needs.
+            // Char counts, not token counts — divide by ~4 for Qwen BPE.
+            int[] sys = promptSizeStats(PROMPT_SIZE_SYSTEM);
+            int[] full = promptSizeStats(PROMPT_SIZE_FULL);
+            pw.println("  prompt size (chars, ~4 chars/token):");
+            if (sys == null) {
+                pw.println("    system prompt: no samples yet");
+            } else {
+                pw.println("    system prompt   min=" + sys[0] + " p50=" + sys[1]
+                        + " p95=" + sys[2] + " max=" + sys[3]
+                        + " all-time-max=" + sys[4] + " samples=" + sys[5]);
+            }
+            if (full == null) {
+                pw.println("    full ChatML:   no samples yet");
+            } else {
+                pw.println("    full ChatML    min=" + full[0] + " p50=" + full[1]
+                        + " p95=" + full[2] + " max=" + full[3]
+                        + " all-time-max=" + full[4] + " samples=" + full[5]);
+                // v0.5.1: budget is whatever the model was actually loaded
+                // with (mNativeModelCtxSize). Approx 4 chars/token for Qwen
+                // BPE on English. Avoid hardcoded magic numbers; on a
+                // future model bump this stays correct automatically.
+                if (mNativeModelCtxSize > 0) {
+                    long budgetChars = (long) mNativeModelCtxSize * 4;
+                    int pct = (int) (full[2] * 100L / budgetChars);
+                    pw.println("    (ctx budget is " + mNativeModelCtxSize
+                            + " tokens ≈ " + budgetChars + " chars; p95 of "
+                            + full[2] + " chars is " + pct + "% of budget)");
+                } else {
+                    pw.println("    (model not loaded — budget unknown)");
+                }
+            }
             if (mConsentStore != null) {
                 pw.println("  recent audit (newest first):");
                 for (String line : mConsentStore.recentCallsPlain(20)) {
@@ -509,6 +545,45 @@ public class LlmManagerService extends SystemService {
     private static final int DEFAULT_CHAIN_ITERATIONS = 5;
     /** How long to park a dispatcher waiting for the user. */
     private static final long CONSENT_TIMEOUT_MS = 60_000L;
+
+    // ------------------------------------------------------------------
+    // v0.5.1: prompt-size instrumentation (char count, not token count —
+    // Qwen BPE is ~3.5–4 chars/token for English). We need this to decide
+    // whether context compaction / tool-result clearing are real problems
+    // before building them. Chars are cheap to count; tokens require a
+    // JNI call. All in-memory, rolling, surfaced via `dumpsys llm`.
+    // ------------------------------------------------------------------
+    private static final int PROMPT_SIZE_HIST_N = 100;
+    private static final int PROMPT_SIZE_SYSTEM = 0; // system prompt only
+    private static final int PROMPT_SIZE_FULL   = 1; // full ChatML prompt
+    private final int[][] mPromptSizeHist = new int[2][PROMPT_SIZE_HIST_N];
+    private final int[] mPromptSizeCount = new int[2];   // wraps around HIST_N
+    private final int[] mPromptSizeMax = new int[2];
+    private final Object mPromptSizeLock = new Object();
+
+    /** Record a prompt character count into the rolling histogram. */
+    private void recordPromptSize(int which, int chars) {
+        synchronized (mPromptSizeLock) {
+            int idx = mPromptSizeCount[which] % PROMPT_SIZE_HIST_N;
+            mPromptSizeHist[which][idx] = chars;
+            mPromptSizeCount[which]++;
+            if (chars > mPromptSizeMax[which]) mPromptSizeMax[which] = chars;
+        }
+    }
+
+    /** Compute min/p50/p95/max over the last PROMPT_SIZE_HIST_N samples. */
+    private int[] promptSizeStats(int which) {
+        synchronized (mPromptSizeLock) {
+            int n = Math.min(mPromptSizeCount[which], PROMPT_SIZE_HIST_N);
+            if (n == 0) return null;
+            int[] snap = new int[n];
+            System.arraycopy(mPromptSizeHist[which], 0, snap, 0, n);
+            java.util.Arrays.sort(snap);
+            int p50 = snap[n / 2];
+            int p95 = snap[Math.min(n - 1, (int) (n * 0.95))];
+            return new int[] { snap[0], p50, p95, snap[n - 1], mPromptSizeMax[which], mPromptSizeCount[which] };
+        }
+    }
 
     /**
      * Agentic loop. On each iteration: generate at tool-call temperature,
@@ -604,6 +679,25 @@ public class LlmManagerService extends SystemService {
                 Log.w(TAG, "Chain " + sessionId + " bailing — 2 unknown tools");
                 break;
             }
+
+            // v0.5.1: short-circuit on needs_permission. The launcher's
+            // PermissionRequiredCard (keyed on this error string in the
+            // tool_result we already emitted via fireToolResult in
+            // dispatchOneTool) is the correct user-facing element — a
+            // "Open settings" button with a working deep link. Running a
+            // final answer pass just produces redundant prose ("Please
+            // go to Settings...") that then replaces the card in the
+            // chat view, stealing the actionable affordance. Skip the
+            // answer pass, close the stream cleanly, leave the card as
+            // the final message.
+            if (toolResponse != null
+                    && toolResponse.contains("\"error\":\"needs_permission\"")) {
+                Log.i(TAG, "Chain " + sessionId
+                        + " short-circuit on needs_permission (iter=" + iter + ")");
+                try { callback.onToken(""); } catch (RemoteException re) {}
+                try { callback.onComplete(""); } catch (RemoteException re) {}
+                return;
+            }
         }
 
         // Exhausted iterations or bailed — take one final answer pass with
@@ -645,6 +739,8 @@ public class LlmManagerService extends SystemService {
             sb.append(history);
         }
         sb.append("<|im_start|>assistant\n");
+        // v0.5.1: record full ChatML prompt size for `dumpsys llm`.
+        recordPromptSize(PROMPT_SIZE_FULL, sb.length());
         return sb.toString();
     }
 
@@ -974,6 +1070,21 @@ public class LlmManagerService extends SystemService {
           + "- On a tool error, one sentence + one next step.\n"
           + "- Don't call a tool for things you already know. Examples that DON'T need a tool: \"what's 2+2\", \"capital of France\", \"how many days in February\". Just answer.\n";
 
+    /**
+     * Negative-example routing. Steers the model away from pre-trained
+     * shell / filesystem / ContentResolver habits toward the provided
+     * MCP tools. Without this, Qwen 2.5 3B will occasionally suggest
+     * `adb shell`, `cat /data/data/...`, or `content query ...` to the
+     * user when the right answer is the listed tool.
+     */
+    private static final String TOOL_ROUTING_RULES =
+            "TOOL ROUTING — strict\n"
+          + "The user does not have a shell or root. NEVER suggest shell / adb / pm / content / cat / grep commands or content:// URIs. ALWAYS use one of the listed tools above.\n"
+          + "- Contacts questions → search_contacts / get_contact / list_favorites / add_contact / update_contact. Never suggest reading /data/data/com.android.providers.contacts/ or using ContentResolver directly.\n"
+          + "- Calendar questions → list_events / find_free_time / create_event. Never suggest reading calendar provider files or the Calendar ContentUris directly.\n"
+          + "- Opening / starting / launching an app → the built-in launch_app tool with a name (fuzzy match works: \"launch_app\" args:{\"name\":\"Camera\"}). Never suggest \"tap the app icon\" or \"open the app drawer\" — the user asked you to do it, so call the tool.\n"
+          + "If no listed tool matches, say so plainly in one sentence and stop. Do not describe workarounds the user cannot perform.\n";
+
     private static final String FEW_SHOT_EXAMPLES =
             "EXAMPLES\n"
           + "\n"
@@ -1032,7 +1143,15 @@ public class LlmManagerService extends SystemService {
             sb.append("\n").append(toolsBlock).append("\n");
         }
         sb.append("\n").append(OUTPUT_FORMAT_BLOCK);
+        sb.append("\n").append(TOOL_ROUTING_RULES);
         sb.append("\n").append(FEW_SHOT_EXAMPLES);
+        // v0.5.1: record the final prompt character count so `dumpsys llm`
+        // can show a rolling histogram. Chars, not tokens — Qwen BPE is
+        // ~3.5–4 chars/token for English, so divide by 4 for a rough
+        // token estimate. We measure the system message only; the full
+        // ChatML prompt (with user turn + history) is measured in
+        // buildChainPrompt.
+        recordPromptSize(PROMPT_SIZE_SYSTEM, sb.length());
         return sb.toString();
     }
 
@@ -1204,7 +1323,14 @@ public class LlmManagerService extends SystemService {
             if (!bound) {
                 return "{\"error\":\"bind failed for " + pkgName + "/" + svcName + "\"}";
             }
-            if (!latch.await(10, java.util.concurrent.TimeUnit.SECONDS)) {
+            // v0.5.1: bumped from 10s to 60s so the dispatcher wait
+            // exceeds the MCP side's 30s permission gate and matches
+            // CONSENT_TIMEOUT_MS. With the old 10s cap the dispatcher
+            // returned "tool timeout" before a legitimately slow tool
+            // (one waiting on user interaction) could respond, and the
+            // launcher never saw the intended {"error":"needs_permission"}
+            // JSON — so PermissionRequiredCard never fired.
+            if (!latch.await(60, java.util.concurrent.TimeUnit.SECONDS)) {
                 return "{\"error\":\"tool timeout\"}";
             }
             return result[0] != null ? result[0] : "{\"error\":\"null result\"}";
