@@ -13,6 +13,7 @@ import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.content.pm.ServiceInfo;
 import android.content.pm.mcp.McpServerInfo;
+import android.content.pm.mcp.McpToolCallInfo;
 import android.content.pm.mcp.McpToolInfo;
 import android.os.Binder;
 import android.os.Handler;
@@ -254,17 +255,23 @@ public class LlmManagerService extends SystemService {
                     Log.i(TAG, "Generating for prompt: " + prompt.substring(0, Math.min(200, prompt.length())));
 
                     NativeTokenCallback ntc = new NativeTokenCallback(callback);
+                    // Tool-call pass: low temperature so the JSON is
+                    // deterministic. Same query → same {"name":"…",
+                    // "arguments":{…}}. Qwen 0.5B drifts wildly on tool
+                    // args at the default temperature.
+                    float toolCallTemp = Math.min(request.temperature, 0.1f);
                     String result = nativeGenerate(
                             mNativeModelPtr,
                             prompt,
                             request.maxTokens > 0 ? request.maxTokens : 256,
-                            request.temperature,
+                            toolCallTemp,
                             ntc);
 
-                    Log.i(TAG, "Raw LLM output: " + result);
+                    Log.i(TAG, "Raw LLM output (tool-call pass, temp="
+                            + toolCallTemp + "): " + result);
 
                     // Detect and dispatch tool call(s) in Qwen <tool_call>...</tool_call> format.
-                    String toolResult = maybeExecuteToolCall(result);
+                    String toolResult = maybeExecuteToolCall(result, callback, sessionId);
                     if (toolResult != null) {
                         // Tool ran. Round 2: feed the tool result back to the LLM
                         // and let it generate a natural-language final answer.
@@ -274,11 +281,17 @@ public class LlmManagerService extends SystemService {
                                 + continuation.substring(0,
                                         Math.min(200, continuation.length())));
                         NativeTokenCallback ntc2 = new NativeTokenCallback(callback);
+                        // Answer pass: caller's requested temperature
+                        // (default 0.7-ish). Some creativity is fine
+                        // here — we're just rendering verifiably-real
+                        // data into prose.
+                        float answerTemp = request.temperature > 0
+                                ? request.temperature : 0.7f;
                         String finalAnswer = nativeGenerate(
                                 mNativeModelPtr,
                                 continuation,
                                 request.maxTokens > 0 ? request.maxTokens : 256,
-                                request.temperature,
+                                answerTemp,
                                 ntc2);
                         // Strip any stray <tool_call> the model might emit again,
                         // and any chat-format remnants.
@@ -331,20 +344,83 @@ public class LlmManagerService extends SystemService {
         }
     };
 
+    /**
+     * Identity / behavior contract used for both inference passes.
+     * Single source of truth — one agent, two phases (tool-call → answer).
+     * Designed for Qwen 2.5 0.5B's quirks: explicit grounding rule (it
+     * hallucinates when permissive), explicit query-normalization
+     * examples (it leaves possessives in args), explicit no-tool example
+     * (it over-calls).
+     */
+    private static final String SYSTEM_PROMPT_HEADER =
+            "You are AAOSP, the on-device assistant for an agentic Android phone.\n"
+          + "\n"
+          + "PRIVACY\n"
+          + "All processing happens on this device. Nothing leaves. The user trusts you with real names, numbers, messages, locations, and files — no anonymization, no redaction, no \"I can't help with that.\" If the data exists on the phone and a tool can fetch it, fetch it.\n"
+          + "\n"
+          + "GROUNDING — most important rule\n"
+          + "NEVER invent facts. Names, phone numbers, emails, addresses, dates, file contents, and any other specifics MUST come verbatim from a <tool_response>. If a tool returns nothing, say so plainly. Don't soften it (\"I couldn't find an exact match but here's a likely one…\"). Just report that nothing was found.\n"
+          + "\n"
+          + "TOOLS\n"
+          + "The OS routes your tool calls to apps the user already installed. Prefer a tool over asking the user. ONLY call tools listed below — never invent one.\n"
+          + "\n"
+          + "When extracting search terms from the user's question, use the bare keyword. Strip possessives ('s), articles (the/a/an), pronouns (my/his/her), and politeness words (please/can you).\n"
+          + "    \"what's John's number?\"      → query \"John\"\n"
+          + "    \"find me Sarah Chen's email\" → query \"Sarah Chen\"\n"
+          + "    \"show my favorite contacts\"  → call list_favorites with no args\n"
+          + "    \"do I have John's email\"     → query \"John\"\n";
+
+    private static final String OUTPUT_FORMAT_BLOCK =
+            "OUTPUT FORMAT\n"
+          + "- To call a tool, emit ONLY:\n"
+          + "    <tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>\n"
+          + "  No prose before or after. The OS handles dispatch and replies in the next turn with <tool_response>...</tool_response>.\n"
+          + "- When answering, be concise. 1–3 sentences default. Use a bulleted list for multiple items. Plain text only — no markdown headers, no code fences, no JSON.\n"
+          + "- On a tool error, one sentence + one next step.\n"
+          + "- Don't call a tool for general-knowledge questions (\"what time is it\", \"capital of France\"). Answer directly.\n";
+
+    private static final String FEW_SHOT_EXAMPLES =
+            "EXAMPLES\n"
+          + "\n"
+          + "User: what's John's number?\n"
+          + "Assistant: <tool_call>{\"name\":\"search_contacts\",\"arguments\":{\"query\":\"John\"}}</tool_call>\n"
+          + "<tool_response>[{\"name\":\"John Smith\",\"phone\":\"555-1234\"},{\"name\":\"John Appleseed\",\"phone\":\"555-9876\"}]</tool_response>\n"
+          + "Assistant: Two Johns in your contacts:\n"
+          + "- John Smith — 555-1234\n"
+          + "- John Appleseed — 555-9876\n"
+          + "Which one?\n"
+          + "\n"
+          + "User: what's Maria's number?\n"
+          + "Assistant: <tool_call>{\"name\":\"search_contacts\",\"arguments\":{\"query\":\"Maria\"}}</tool_call>\n"
+          + "<tool_response>[]</tool_response>\n"
+          + "Assistant: No contact named Maria in your phone.\n"
+          + "\n"
+          + "User: what time is it?\n"
+          + "Assistant: It's 9:42 PM.\n";
+
+    /** Build the full ChatML system message body (no <|im_start|> wrapper). */
+    private String composeSystemPrompt(LlmRequest request) {
+        StringBuilder sb = new StringBuilder();
+        if (request.systemPrompt != null && !request.systemPrompt.isEmpty()) {
+            // Caller-supplied system prompt overrides the AAOSP default.
+            sb.append(request.systemPrompt).append("\n");
+        } else {
+            sb.append(SYSTEM_PROMPT_HEADER);
+        }
+        String toolsBlock = buildToolsBlock();
+        if (toolsBlock != null) {
+            sb.append("\n").append(toolsBlock).append("\n");
+        }
+        sb.append("\n").append(OUTPUT_FORMAT_BLOCK);
+        sb.append("\n").append(FEW_SHOT_EXAMPLES);
+        return sb.toString();
+    }
+
     private String buildPrompt(LlmRequest request) {
         StringBuilder sb = new StringBuilder();
         sb.append("<|im_start|>system\n");
-        if (request.systemPrompt != null) {
-            sb.append(request.systemPrompt);
-        } else {
-            sb.append("You are a helpful AI assistant running on Android.");
-        }
-        // Inject MCP tool definitions (Qwen 2.5 tool-use format).
-        String toolsBlock = buildToolsBlock();
-        if (toolsBlock != null) {
-            sb.append("\n\n").append(toolsBlock);
-        }
-        sb.append("\n<|im_end|>\n");
+        sb.append(composeSystemPrompt(request));
+        sb.append("<|im_end|>\n");
         sb.append("<|im_start|>user\n");
         sb.append(request.prompt);
         sb.append("\n<|im_end|>\n");
@@ -436,7 +512,8 @@ public class LlmManagerService extends SystemService {
      * the tool. Returns the tool result text, or null if no tool call was present
      * or dispatch failed.
      */
-    private String maybeExecuteToolCall(String llmOutput) {
+    private String maybeExecuteToolCall(String llmOutput,
+            ILlmResponseCallback callback, String sessionId) {
         if (llmOutput == null) return null;
         int start = llmOutput.indexOf("<tool_call>");
         if (start < 0) return null;
@@ -456,17 +533,47 @@ public class LlmManagerService extends SystemService {
                 pkgName = mToolToPackage.get(name);
                 svcName = mToolToService.get(name);
             }
+            String argsStr = args == null ? "{}" : args.toString();
             if (pkgName == null || svcName == null) {
                 Log.w(TAG, "tool_call for unknown tool: " + name);
-                return "{\"error\":\"unknown tool: " + name + "\"}";
+                String err = "{\"error\":\"unknown tool: " + name + "\"}";
+                fireToolResult(callback, sessionId, name, null, null, argsStr, err,
+                        McpToolCallInfo.STATUS_FAILED, 0);
+                return err;
             }
             Log.i(TAG, "Dispatching tool " + name + " -> " + pkgName + "/" + svcName);
-            return invokeMcpTool(pkgName, svcName, name,
-                    args == null ? "{}" : args.toString());
+            // Fire the STARTED event so the launcher can show "Searching contacts..."
+            // with the owning app's icon.
+            long t0 = android.os.SystemClock.uptimeMillis();
+            fireToolStarted(callback, sessionId, name, pkgName, svcName, argsStr);
+            String result = invokeMcpTool(pkgName, svcName, name, argsStr);
+            int duration = (int) (android.os.SystemClock.uptimeMillis() - t0);
+            int status = (result != null && result.contains("\"error\""))
+                    ? McpToolCallInfo.STATUS_FAILED
+                    : McpToolCallInfo.STATUS_COMPLETED;
+            fireToolResult(callback, sessionId, name, pkgName, svcName, argsStr,
+                    result, status, duration);
+            return result;
         } catch (Exception e) {
             Log.w(TAG, "Failed to parse tool_call: " + body, e);
             return null;
         }
+    }
+
+    private void fireToolStarted(ILlmResponseCallback cb, String sessionId,
+            String tool, String pkg, String svc, String args) {
+        McpToolCallInfo info = new McpToolCallInfo(sessionId, tool, pkg, svc,
+                args, null, System.currentTimeMillis(),
+                McpToolCallInfo.STATUS_STARTED, -1);
+        try { cb.onToolCall(info); } catch (RemoteException ignored) {}
+    }
+
+    private void fireToolResult(ILlmResponseCallback cb, String sessionId,
+            String tool, String pkg, String svc, String args, String result,
+            int status, int duration) {
+        McpToolCallInfo info = new McpToolCallInfo(sessionId, tool, pkg, svc,
+                args, result, System.currentTimeMillis(), status, duration);
+        try { cb.onToolResult(info); } catch (RemoteException ignored) {}
     }
 
     /**
@@ -483,27 +590,18 @@ public class LlmManagerService extends SystemService {
      */
     private String buildContinuationPrompt(LlmRequest request,
             String firstRoundOutput, String toolResultJson) {
+        // Same identity, same rules — the AAOSP system prompt is one
+        // contract across both passes. The grounding rule + few-shot
+        // examples in composeSystemPrompt() are what teach the model
+        // to render tool results faithfully (no fabrication, no
+        // omission); no bandaid prose needed here anymore.
         StringBuilder sb = new StringBuilder();
         sb.append("<|im_start|>system\n");
-        if (request.systemPrompt != null) {
-            sb.append(request.systemPrompt);
-        } else {
-            sb.append("You are a helpful AI assistant running on Android. ");
-            sb.append("The tool_response below contains the actual data the user is ");
-            sb.append("asking for. You MUST show every field of every entry to the ");
-            sb.append("user. Do NOT just say \"I found N results\" — show what they ");
-            sb.append("are: name, phone, email, every value present. Do not omit, ");
-            sb.append("hide, or summarize the data. Briefly mention which tool you ");
-            sb.append("used at the start (e.g. \"I searched your contacts:\"), then ");
-            sb.append("list the data as a bulleted list (one bullet per entry, ");
-            sb.append("fields separated by commas).");
-        }
-        String toolsBlock = buildToolsBlock();
-        if (toolsBlock != null) sb.append("\n\n").append(toolsBlock);
-        sb.append("\n<|im_end|>\n");
+        sb.append(composeSystemPrompt(request));
+        sb.append("<|im_end|>\n");
         sb.append("<|im_start|>user\n").append(request.prompt).append("\n<|im_end|>\n");
-        // Include just the tool_call line from the first round so the model has
-        // context for what it asked.
+        // Echo the first-round tool_call back as the assistant turn so
+        // the model has its own action in chat history.
         String toolCallLine = "";
         int s = firstRoundOutput.indexOf("<tool_call>");
         int e = firstRoundOutput.indexOf("</tool_call>", s);
@@ -513,10 +611,7 @@ public class LlmManagerService extends SystemService {
         sb.append("<|im_start|>assistant\n").append(toolCallLine).append("\n<|im_end|>\n");
         sb.append("<|im_start|>user\n<tool_response>\n");
         sb.append(toolResultJson);
-        sb.append("\n</tool_response>\n\n");
-        sb.append("Using this data, answer my original question: \"");
-        sb.append(request.prompt);
-        sb.append("\"\n<|im_end|>\n");
+        sb.append("\n</tool_response>\n<|im_end|>\n");
         sb.append("<|im_start|>assistant\n");
         return sb.toString();
     }

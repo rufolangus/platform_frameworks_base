@@ -175,13 +175,17 @@ public class LlmManager {
         /** Called for each streamed token. */
         public void onToken(@NonNull String token) {}
 
-        /** Called when the LLM invokes an MCP tool. */
-        public void onToolCall(@NonNull String toolName,
-                @NonNull String argumentsJson) {}
+        /**
+         * Called when the LLM dispatches an MCP tool. {@code info.status}
+         * is {@code STATUS_STARTED} on the entry event.
+         */
+        public void onToolCall(@NonNull android.content.pm.mcp.McpToolCallInfo info) {}
 
-        /** Called when a tool call completes. */
-        public void onToolResult(@NonNull String toolName,
-                @NonNull String resultJson) {}
+        /**
+         * Called when a tool call finishes — completed, failed, or
+         * permission-required. Inspect {@code info.status}.
+         */
+        public void onToolResult(@NonNull android.content.pm.mcp.McpToolCallInfo info) {}
 
         /** Called when the LLM produces structured UI JSON. */
         public void onServerUi(@NonNull String serverUiJson) {}
@@ -212,13 +216,13 @@ public class LlmManager {
         }
 
         @Override
-        public void onToolCall(String toolName, String argumentsJson) {
-            mExecutor.execute(() -> mCallback.onToolCall(toolName, argumentsJson));
+        public void onToolCall(android.content.pm.mcp.McpToolCallInfo info) {
+            mExecutor.execute(() -> mCallback.onToolCall(info));
         }
 
         @Override
-        public void onToolResult(String toolName, String resultJson) {
-            mExecutor.execute(() -> mCallback.onToolResult(toolName, resultJson));
+        public void onToolResult(android.content.pm.mcp.McpToolCallInfo info) {
+            mExecutor.execute(() -> mCallback.onToolResult(info));
         }
 
         @Override
