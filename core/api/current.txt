@@ -1176,6 +1176,8 @@ package android {
     field public static final int maxSdkVersion = 16843377; // 0x1010271
     field public static final int maxWidth = 16843039; // 0x101011f
     field public static final int maximumAngle = 16843903; // 0x101047f
+    field public static final int mcpRequired;
+    field public static final int mcpRequiresConfirmation;
     field public static final int measureAllChildren = 16843018; // 0x101010a
     field public static final int measureWithLargestChild = 16843476; // 0x10102d4
     field public static final int mediaRouteButtonStyle = 16843693; // 0x10103ad

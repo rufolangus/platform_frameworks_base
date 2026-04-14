@@ -118,6 +118,9 @@
     <public name="languageSettingsActivity"/>
     <!-- @FlaggedApi("android.service.controls.flags.Flags.FLAG_HOME_PANEL_DREAM") -->
     <public name="dreamCategory"/>
+    <!-- AAOSP: MCP tool attrs -->
+    <public name="mcpRequiresConfirmation"/>
+    <public name="mcpRequired"/>
   </staging-public-group>
 
   <staging-public-group type="id" first-id="0x01b60000">

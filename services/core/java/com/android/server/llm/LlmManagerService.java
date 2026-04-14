@@ -4,29 +4,53 @@
  */
 package com.android.server.llm;
 
+import android.app.KeyguardManager;
+import android.content.BroadcastReceiver;
+import android.content.ComponentName;
 import android.content.Context;
-import android.llm.ILlmResponseCallback;
-import android.llm.ILlmService;
-import android.llm.LlmRequest;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.content.pm.ServiceInfo;
 import android.content.pm.mcp.McpServerInfo;
 import android.content.pm.mcp.McpToolCallInfo;
 import android.content.pm.mcp.McpToolInfo;
+import android.llm.ILlmResponseCallback;
+import android.llm.ILlmService;
+import android.llm.LlmRequest;
+import android.net.Uri;
 import android.os.Binder;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.RemoteException;
+import android.os.SystemClock;
+import android.os.UserHandle;
 import android.util.Log;
 
 import com.android.server.SystemService;
 import com.android.server.pm.McpPackageHandler;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import java.io.File;
+import java.io.FileDescriptor;
+import java.io.PrintWriter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class LlmManagerService extends SystemService {
 
@@ -48,6 +72,17 @@ public class LlmManagerService extends SystemService {
     private Handler mInferenceHandler;
     private volatile long mNativeModelPtr = 0;
     private String mModelPath;
+
+    // v0.4: HITL consent + audit log
+    private HitlConsentStore mConsentStore;
+    private LlmSessionStore mSessionStore;
+    // sessionIds the launcher (or anyone) asked us to abort. Checked at
+    // every iteration of the chain loop and during consent gate waits.
+    private final Set<String> mCanceledSessions =
+            ConcurrentHashMap.newKeySet();
+    // Parked consent prompts. Key = sessionId+"|"+toolName.
+    private final Map<String, ConsentGate> mPendingGates =
+            new ConcurrentHashMap<>();
 
     public LlmManagerService(Context context) {
         super(context);
@@ -71,6 +106,20 @@ public class LlmManagerService extends SystemService {
             mInferenceThread.start();
             mInferenceHandler = new Handler(mInferenceThread.getLooper());
 
+            // v0.4: persistent stores
+            try {
+                mSessionStore = new LlmSessionStore(mContext);
+                mConsentStore = new HitlConsentStore(mContext);
+                Log.i(TAG, "Session + consent stores opened");
+            } catch (Exception e) {
+                Log.e(TAG, "Store init failed — running without persistence", e);
+            }
+
+            // Watch for app uninstall / upgrade so we can prune
+            // stale consent grants. Signature-mismatch invalidation
+            // also handled lazily on grant lookup.
+            registerPackageMonitor();
+
             // Try to load model
             mInferenceHandler.post(this::loadModel);
         }
@@ -92,7 +141,13 @@ public class LlmManagerService extends SystemService {
 
         Log.i(TAG, "Loading model from " + mModelPath);
         try {
-            mNativeModelPtr = nativeLoadModel(mModelPath, 2048, 0, 4);
+            // v0.5: ctx bumped 2048 → 4096 for the 3B model. 0.5B couldn't
+            // really use a longer context anyway; 3B benefits on chained
+            // tool calls where the <tool_response> history can be bulky.
+            // threads 4 → 8 to take advantage of Cuttlefish --cpus=16;
+            // on a phone this should match the number of big cores (~6-8
+            // on a modern flagship). No effect on model quality.
+            mNativeModelPtr = nativeLoadModel(mModelPath, 4096, 0, 8);
             if (mNativeModelPtr != 0) {
                 Log.i(TAG, "Model loaded: " + nativeGetModelInfo(mNativeModelPtr));
             } else {
@@ -238,8 +293,18 @@ public class LlmManagerService extends SystemService {
                     "android.permission.SUBMIT_LLM_REQUEST",
                     "Must hold SUBMIT_LLM_REQUEST");
 
-            String sessionId = UUID.randomUUID().toString();
-            Log.i(TAG, "Submit " + sessionId + " from uid " + Binder.getCallingUid());
+            // Honor session continuity: if the caller passes a sessionId
+            // we keep it (multi-turn chat), otherwise mint a fresh one.
+            final String sessionId = (request.sessionId != null
+                    && !request.sessionId.isEmpty())
+                    ? request.sessionId : UUID.randomUUID().toString();
+            Log.i(TAG, "Submit " + sessionId + " from uid "
+                    + Binder.getCallingUid()
+                    + (request.sessionId != null ? " (continuing)" : " (new)"));
+
+            // A new submit on a canceled id is allowed — the user may have
+            // started a fresh chat in the same session slot.
+            mCanceledSessions.remove(sessionId);
 
             if (mNativeModelPtr == 0) {
                 try {
@@ -248,64 +313,21 @@ public class LlmManagerService extends SystemService {
                 return sessionId;
             }
 
-            // Run inference on background thread
+            final int callerUserId = UserHandle.getUserId(Binder.getCallingUid());
+
+            // v0.4 debug: log the incoming user prompt + any carried history
+            // so we can see exactly what the model is asked to answer.
+            Log.i(TAG, "Submit prompt (" + (request.prompt == null ? 0
+                    : request.prompt.length()) + " chars): "
+                    + truncateForLog(request.prompt));
+            if (request.conversationJson != null) {
+                Log.i(TAG, "Submit history: "
+                        + truncateForLog(request.conversationJson));
+            }
+
             mInferenceHandler.post(() -> {
                 try {
-                    String prompt = buildPrompt(request);
-                    Log.i(TAG, "Generating for prompt: " + prompt.substring(0, Math.min(200, prompt.length())));
-
-                    NativeTokenCallback ntc = new NativeTokenCallback(callback);
-                    // Tool-call pass: low temperature so the JSON is
-                    // deterministic. Same query → same {"name":"…",
-                    // "arguments":{…}}. Qwen 0.5B drifts wildly on tool
-                    // args at the default temperature.
-                    float toolCallTemp = Math.min(request.temperature, 0.1f);
-                    String result = nativeGenerate(
-                            mNativeModelPtr,
-                            prompt,
-                            request.maxTokens > 0 ? request.maxTokens : 256,
-                            toolCallTemp,
-                            ntc);
-
-                    Log.i(TAG, "Raw LLM output (tool-call pass, temp="
-                            + toolCallTemp + "): " + result);
-
-                    // Detect and dispatch tool call(s) in Qwen <tool_call>...</tool_call> format.
-                    String toolResult = maybeExecuteToolCall(result, callback, sessionId);
-                    if (toolResult != null) {
-                        // Tool ran. Round 2: feed the tool result back to the LLM
-                        // and let it generate a natural-language final answer.
-                        String continuation = buildContinuationPrompt(
-                                request, result, toolResult);
-                        Log.i(TAG, "Round-2 continuation prompt: "
-                                + continuation.substring(0,
-                                        Math.min(200, continuation.length())));
-                        NativeTokenCallback ntc2 = new NativeTokenCallback(callback);
-                        // Answer pass: caller's requested temperature
-                        // (default 0.7-ish). Some creativity is fine
-                        // here — we're just rendering verifiably-real
-                        // data into prose.
-                        float answerTemp = request.temperature > 0
-                                ? request.temperature : 0.7f;
-                        String finalAnswer = nativeGenerate(
-                                mNativeModelPtr,
-                                continuation,
-                                request.maxTokens > 0 ? request.maxTokens : 256,
-                                answerTemp,
-                                ntc2);
-                        // Strip any stray <tool_call> the model might emit again,
-                        // and any chat-format remnants.
-                        String clean = stripChatRemnants(finalAnswer);
-                        try { callback.onToken(clean); } catch (RemoteException re) {}
-                        callback.onComplete(clean);
-                        Log.i(TAG, "Generation+tool+round2 complete: "
-                                + clean.length() + " chars");
-                    } else {
-                        // No tool call — emit the raw buffer as-is.
-                        ntc.emitBuffer();
-                        callback.onComplete(result);
-                        Log.i(TAG, "Generation complete: " + result.length() + " chars");
-                    }
+                    runChain(sessionId, callerUserId, request, callback);
                 } catch (Exception e) {
                     Log.e(TAG, "Inference error", e);
                     try {
@@ -319,7 +341,17 @@ public class LlmManagerService extends SystemService {
 
         @Override
         public void cancel(String sessionId) {
+            if (sessionId == null) return;
             Log.i(TAG, "Cancel " + sessionId);
+            mCanceledSessions.add(sessionId);
+            // Wake any parked consent gate for this session.
+            for (Map.Entry<String, ConsentGate> e : mPendingGates.entrySet()) {
+                if (e.getKey().startsWith(sessionId + "|")) {
+                    e.getValue().resolve(HitlConsentStore.DECISION_DENY,
+                            HitlConsentStore.SCOPE_ONCE,
+                            HitlConsentStore.CONSENT_TIMED_OUT);
+                }
+            }
         }
 
         @Override
@@ -342,7 +374,565 @@ public class LlmManagerService extends SystemService {
             }
             return nativeGetModelInfo(mNativeModelPtr);
         }
+
+        @Override
+        public void confirmToolCall(String sessionId, String toolName,
+                int decision, int scope) {
+            mContext.enforceCallingOrSelfPermission(
+                    "android.permission.SUBMIT_LLM_REQUEST",
+                    "Must hold SUBMIT_LLM_REQUEST");
+            if (sessionId == null || toolName == null) return;
+            // Defensive: unknown / weird decision values → DENY.
+            if (decision != HitlConsentStore.DECISION_ALLOW) {
+                decision = HitlConsentStore.DECISION_DENY;
+            }
+            if (scope < HitlConsentStore.SCOPE_ONCE
+                    || scope > HitlConsentStore.SCOPE_FOREVER) {
+                scope = HitlConsentStore.SCOPE_ONCE;
+            }
+            // Write-intent tools can't be granted FOREVER — downgrade.
+            Boolean requires;
+            synchronized (mToolRouteLock) {
+                requires = mToolRequiresConsent.get(toolName);
+            }
+            if (requires != null && requires
+                    && scope == HitlConsentStore.SCOPE_FOREVER) {
+                Log.i(TAG, "Downgrading FOREVER→SESSION for write-intent tool "
+                        + toolName);
+                scope = HitlConsentStore.SCOPE_SESSION;
+            }
+            int auditCode = auditCodeFor(decision, scope);
+            ConsentGate gate = mPendingGates.get(sessionId + "|" + toolName);
+            if (gate == null) {
+                Log.w(TAG, "confirmToolCall: no pending gate for "
+                        + sessionId + "/" + toolName);
+                return;
+            }
+            gate.resolve(decision, scope, auditCode);
+        }
+
+        @Override
+        public void revokeToolGrant(String packageName, String toolName) {
+            mContext.enforceCallingOrSelfPermission(
+                    "android.permission.SUBMIT_LLM_REQUEST",
+                    "Must hold SUBMIT_LLM_REQUEST");
+            if (packageName == null || toolName == null || mConsentStore == null) return;
+            int userId = UserHandle.getUserId(Binder.getCallingUid());
+            mConsentStore.revoke(userId, packageName, toolName);
+            Log.i(TAG, "Revoked " + packageName + "/" + toolName
+                    + " for user " + userId);
+        }
+
+        @Override
+        public String getRecentAuditCalls(int limit) {
+            mContext.enforceCallingOrSelfPermission(
+                    "android.permission.SUBMIT_LLM_REQUEST",
+                    "Must hold SUBMIT_LLM_REQUEST");
+            if (mConsentStore == null) return "[]";
+            return mConsentStore.recentCallsJson(Math.max(1, Math.min(limit, 500)));
+        }
+
+        @Override
+        public void endSession(String sessionId) {
+            if (sessionId == null) return;
+            Log.i(TAG, "endSession " + sessionId);
+            mCanceledSessions.add(sessionId);
+            if (mConsentStore != null) {
+                mConsentStore.clearSessionScoped(sessionId);
+            }
+            // Resolve any parked gates as DENY so dispatchers unblock.
+            for (Map.Entry<String, ConsentGate> e : mPendingGates.entrySet()) {
+                if (e.getKey().startsWith(sessionId + "|")) {
+                    e.getValue().resolve(HitlConsentStore.DECISION_DENY,
+                            HitlConsentStore.SCOPE_ONCE,
+                            HitlConsentStore.CONSENT_TIMED_OUT);
+                }
+            }
+        }
+
+        @Override
+        protected void dump(FileDescriptor fd, PrintWriter pw, String[] args) {
+            pw.println("LlmManagerService state:");
+            pw.println("  model: " + (mNativeModelPtr != 0 ? mModelPath : "NOT LOADED"));
+            pw.println("  pending consent gates: " + mPendingGates.size());
+            pw.println("  canceled sessions: " + mCanceledSessions.size());
+            // Pull registered tools from the registry directly so dumpsys
+            // is meaningful even before the first submit populates the
+            // per-submit routing cache. Includes the built-in launch_app.
+            int toolCount = 0;
+            List<McpServerInfo> servers = McpPackageHandler.getRegistry().getAllServers();
+            for (McpServerInfo s : servers) {
+                toolCount += (s.tools == null ? 0 : s.tools.size());
+            }
+            pw.println("  registered tools: " + (toolCount + 1)
+                    + " (" + toolCount + " MCP + 1 built-in)");
+            for (McpServerInfo s : servers) {
+                if (s.tools == null) continue;
+                for (McpToolInfo t : s.tools) {
+                    pw.println("    " + t.name + " → " + s.packageName
+                            + (t.requiresConfirmation ? " [consent]" : ""));
+                }
+            }
+            pw.println("    " + TOOL_LAUNCH_APP + " → " + BUILTIN_PKG
+                    + " [builtin]");
+            if (mConsentStore != null) {
+                pw.println("  recent audit (newest first):");
+                for (String line : mConsentStore.recentCallsPlain(20)) {
+                    pw.println("    " + line);
+                }
+            }
+        }
     };
+
+    /** Map (decision, scope) → audit_calls.consent_decision enum. */
+    private static int auditCodeFor(int decision, int scope) {
+        if (decision == HitlConsentStore.DECISION_DENY) {
+            return HitlConsentStore.CONSENT_DENIED;
+        }
+        switch (scope) {
+            case HitlConsentStore.SCOPE_SESSION:
+                return HitlConsentStore.CONSENT_ALLOWED_SESS;
+            case HitlConsentStore.SCOPE_FOREVER:
+                return HitlConsentStore.CONSENT_ALLOWED_FOREVER;
+            case HitlConsentStore.SCOPE_ONCE:
+            default:
+                return HitlConsentStore.CONSENT_ALLOWED_ONCE;
+        }
+    }
+
+    // ============================================================
+    //  Chain loop + consent gate
+    // ============================================================
+
+    /** Hard ceiling on tool iterations per submit. LlmRequest clamps to this. */
+    private static final int MAX_CHAIN_ITERATIONS_CAP = 8;
+    private static final int DEFAULT_CHAIN_ITERATIONS = 5;
+    /** How long to park a dispatcher waiting for the user. */
+    private static final long CONSENT_TIMEOUT_MS = 60_000L;
+
+    /**
+     * Agentic loop. On each iteration: generate at tool-call temperature,
+     * see if the model emitted a <tool_call>. If yes, dispatch (with HITL)
+     * and loop with the response appended. If no, do one final pass at
+     * answer temperature and emit the result.
+     *
+     * <p>Bounds: {@code maxToolCalls} (default 5, cap 8) per submit;
+     * {@link #CONSENT_TIMEOUT_MS} per prompt; a 2-in-a-row unknown-tool
+     * streak short-circuits the loop to avoid the model flailing.
+     */
+    private void runChain(String sessionId, int userId, LlmRequest request,
+            ILlmResponseCallback callback) throws RemoteException {
+        int maxIters = request.maxToolCalls > 0
+                ? Math.min(request.maxToolCalls, MAX_CHAIN_ITERATIONS_CAP)
+                : DEFAULT_CHAIN_ITERATIONS;
+        // v0.4 tune: floor raised from 0.1 → 0.25. At 0.1 the model
+        // pattern-locks on few-shot final-answer text and skips the
+        // <tool_call> entirely for write requests. Still cool enough
+        // that tool-call JSON stays stable.
+        float toolCallTemp = Math.min(request.temperature, 0.25f);
+        float answerTemp = request.temperature > 0 ? request.temperature : 0.7f;
+        int maxTokens = request.maxTokens > 0 ? request.maxTokens : 256;
+
+        // History accumulates assistant <tool_call> + user <tool_response>
+        // pairs between iterations so the model sees its own prior steps.
+        StringBuilder history = new StringBuilder();
+        int unknownStreak = 0;
+
+        for (int iter = 0; iter < maxIters; iter++) {
+            if (mCanceledSessions.contains(sessionId)) {
+                Log.i(TAG, "Chain " + sessionId + " canceled before iter " + iter);
+                return;
+            }
+            String prompt = buildChainPrompt(request, history.toString());
+            NativeTokenCallback ntc = new NativeTokenCallback(callback);
+            String raw = nativeGenerate(mNativeModelPtr, prompt, maxTokens,
+                    toolCallTemp, ntc);
+            Log.i(TAG, "iter=" + iter + " raw=" + truncateForLog(raw));
+
+            int start = raw == null ? -1 : raw.indexOf("<tool_call>");
+            int end = raw == null ? -1 : raw.indexOf("</tool_call>",
+                    Math.max(0, start));
+            if (start < 0 || end < 0) {
+                // No tool_call → the model chose to answer directly. Emit
+                // verbatim (it's already prose) with chat tokens stripped.
+                String clean = stripChatRemnants(raw == null ? "" : raw);
+                try { callback.onToken(clean); } catch (RemoteException re) {}
+                callback.onComplete(clean);
+                Log.i(TAG, "Chain " + sessionId + " completed at iter " + iter
+                        + " with direct answer (" + clean.length() + " chars)");
+                return;
+            }
+
+            String toolCallBlock = raw.substring(start,
+                    end + "</tool_call>".length());
+            String body = raw.substring(start + "<tool_call>".length(), end).trim();
+            String toolName = null;
+            String argsStr = "{}";
+            try {
+                JSONObject obj = new JSONObject(body);
+                toolName = obj.optString("name", null);
+                JSONObject args = obj.optJSONObject("arguments");
+                if (args != null) argsStr = args.toString();
+            } catch (Exception e) {
+                Log.w(TAG, "Bad tool_call JSON: " + body);
+            }
+
+            if (toolName == null) {
+                // Malformed → treat like no tool call and break out.
+                String clean = stripChatRemnants(raw);
+                try { callback.onToken(clean); } catch (RemoteException re) {}
+                callback.onComplete(clean);
+                return;
+            }
+
+            String toolResponse = dispatchOneTool(sessionId, userId, iter,
+                    toolName, argsStr, callback);
+
+            // Append assistant's tool_call + the response as user turn so
+            // the next iteration sees the full trace.
+            history.append("<|im_start|>assistant\n").append(toolCallBlock)
+                    .append("\n<|im_end|>\n");
+            history.append("<|im_start|>user\n<tool_response>\n")
+                    .append(toolResponse).append("\n</tool_response>\n<|im_end|>\n");
+
+            // Unknown-tool circuit breaker: 2 in a row → give up chaining
+            // and let the model answer.
+            boolean unknown = toolResponse != null
+                    && toolResponse.contains("\"unknown tool");
+            unknownStreak = unknown ? unknownStreak + 1 : 0;
+            if (unknownStreak >= 2) {
+                Log.w(TAG, "Chain " + sessionId + " bailing — 2 unknown tools");
+                break;
+            }
+        }
+
+        // Exhausted iterations or bailed — take one final answer pass with
+        // the full history in context.
+        if (mCanceledSessions.contains(sessionId)) return;
+        String finalPrompt = buildChainPrompt(request, history.toString());
+        NativeTokenCallback ntc2 = new NativeTokenCallback(callback);
+        String finalRaw = nativeGenerate(mNativeModelPtr, finalPrompt, maxTokens,
+                answerTemp, ntc2);
+        String clean = stripChatRemnants(finalRaw == null ? "" : finalRaw);
+        try { callback.onToken(clean); } catch (RemoteException re) {}
+        callback.onComplete(clean);
+        Log.i(TAG, "Chain " + sessionId + " completed via final answer pass ("
+                + clean.length() + " chars)");
+    }
+
+    /**
+     * Build a ChatML prompt that includes the system contract, the user
+     * turn, any prior assistant/tool history for this chain, and an open
+     * assistant turn for the model to fill.
+     */
+    private String buildChainPrompt(LlmRequest request, String history) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("<|im_start|>system\n");
+        sb.append(composeSystemPrompt(request));
+        sb.append("<|im_end|>\n");
+        // Prior-turn conversation (launcher-side history). Each entry is
+        // {"role":"user"|"assistant"|"tool","content":"..."}. Skip the
+        // current user prompt if the launcher included it, to avoid
+        // duplicating it below.
+        appendConversationHistory(sb, request);
+        sb.append("<|im_start|>user\n");
+        sb.append(escapeChat(request.prompt));
+        sb.append("\n<|im_end|>\n");
+        // In-chain history (this submit's own tool_call / tool_response
+        // pairs) is appended after the user turn so the model sees its
+        // prior actions within the current request.
+        if (history != null && !history.isEmpty()) {
+            sb.append(history);
+        }
+        sb.append("<|im_start|>assistant\n");
+        return sb.toString();
+    }
+
+    /**
+     * Append previous-turn messages from {@link LlmRequest#conversationJson}
+     * (launcher-managed history) as ChatML turns. Best-effort — a parse
+     * failure just skips the history.
+     */
+    private void appendConversationHistory(StringBuilder sb, LlmRequest request) {
+        if (request.conversationJson == null
+                || request.conversationJson.isEmpty()) return;
+        try {
+            JSONArray arr = new JSONArray(request.conversationJson);
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject m = arr.optJSONObject(i);
+                if (m == null) continue;
+                String role = m.optString("role", "user");
+                String content = m.optString("content", "");
+                if (content.isEmpty()) continue;
+                // Avoid duplicating the current user prompt if the
+                // launcher stuffed it into history as the last entry.
+                if (i == arr.length() - 1 && "user".equals(role)
+                        && content.equals(request.prompt)) continue;
+                sb.append("<|im_start|>").append(role).append("\n");
+                sb.append(escapeChat(content));
+                sb.append("\n<|im_end|>\n");
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Bad conversationJson: " + e);
+        }
+    }
+
+    /**
+     * Dispatch exactly one tool call: resolve the route, check persisted
+     * consent, prompt the user if needed, bind + invoke, fire typed events,
+     * and audit every step. Returns the tool response JSON (always a valid
+     * string, synthesizing an {@code {"error":...}} on any failure).
+     */
+    private String dispatchOneTool(String sessionId, int userId, int iterIndex,
+            String toolName, String argsStr, ILlmResponseCallback callback) {
+        String pkgName, svcName;
+        Boolean requiresConsentBox;
+        synchronized (mToolRouteLock) {
+            pkgName = mToolToPackage.get(toolName);
+            svcName = mToolToService.get(toolName);
+            requiresConsentBox = mToolRequiresConsent.get(toolName);
+        }
+        long t0 = SystemClock.uptimeMillis();
+        if (pkgName == null || svcName == null) {
+            String err = "{\"error\":\"unknown tool: " + toolName + "\"}";
+            fireToolStarted(callback, sessionId, toolName, null, null,
+                    argsStr, iterIndex);
+            fireToolResult(callback, sessionId, toolName, null, null,
+                    argsStr, err, McpToolCallInfo.STATUS_FAILED, 0, iterIndex);
+            recordAudit(userId, sessionId, "(unknown)", toolName, argsStr,
+                    err, McpToolCallInfo.STATUS_FAILED,
+                    HitlConsentStore.CONSENT_NONE, 0, iterIndex);
+            return err;
+        }
+
+        // Built-in framework tool (launch_app) — no bind, no consent
+        // (unless we later gate it). Fires STARTED so the launcher can
+        // react (it reads packageName==BUILTIN_PKG and fires the
+        // launch Intent itself), then synthesizes a success response so
+        // the model continues the chain. Fire-and-forget: the real side
+        // effect (the app opening) is visible to the user.
+        if (BUILTIN_PKG.equals(pkgName)) {
+            fireToolStarted(callback, sessionId, toolName, pkgName, svcName,
+                    argsStr, iterIndex);
+            String result = "{\"status\":\"launched\",\"args\":" + argsStr + "}";
+            int duration = (int) (SystemClock.uptimeMillis() - t0);
+            fireToolResult(callback, sessionId, toolName, pkgName, svcName,
+                    argsStr, result, McpToolCallInfo.STATUS_COMPLETED,
+                    duration, iterIndex);
+            recordAudit(userId, sessionId, pkgName, toolName, argsStr, result,
+                    McpToolCallInfo.STATUS_COMPLETED,
+                    HitlConsentStore.CONSENT_NONE, duration, iterIndex);
+            return result;
+        }
+
+        boolean requiresConsent = requiresConsentBox != null && requiresConsentBox;
+
+        // v0.5 UX fix — fire STARTED *before* the consent gate so the
+        // user sees a tool-call card immediately when the model asks,
+        // not only after they tap Allow. Matters most when consent
+        // takes 60 s or the user is confused about why nothing
+        // happened. The PERMISSION_REQUIRED event (below) is emitted
+        // in addition, not instead — UI state distinguishes them.
+        fireToolStarted(callback, sessionId, toolName, pkgName, svcName,
+                argsStr, iterIndex);
+
+        // --- HITL consent gate ---
+        int consentAuditCode = HitlConsentStore.CONSENT_NONE;
+        int grantDecision = HitlConsentStore.DECISION_ALLOW;
+        if (requiresConsent) {
+            HitlConsentStore.Decision persisted = mConsentStore == null
+                    ? HitlConsentStore.Decision.PROMPT
+                    : mConsentStore.check(userId, pkgName, toolName, sessionId);
+            if (persisted == HitlConsentStore.Decision.DENY_PERSISTED) {
+                String err = "{\"error\":\"denied_by_user\"}";
+                fireToolResult(callback, sessionId, toolName, pkgName, svcName,
+                        argsStr, err, McpToolCallInfo.STATUS_FAILED, 0, iterIndex);
+                recordAudit(userId, sessionId, pkgName, toolName, argsStr, err,
+                        McpToolCallInfo.STATUS_FAILED,
+                        HitlConsentStore.CONSENT_DENIED,
+                        (int) (SystemClock.uptimeMillis() - t0), iterIndex);
+                return err;
+            }
+            if (persisted == HitlConsentStore.Decision.ALLOW) {
+                consentAuditCode = HitlConsentStore.CONSENT_AUTO;
+            } else {
+                // Prompt — but only if the device is unlocked. On the
+                // keyguard we don't surface consent UI.
+                if (isDeviceLocked()) {
+                    String err = "{\"error\":\"device_locked\"}";
+                    fireToolResult(callback, sessionId, toolName, pkgName,
+                            svcName, argsStr, err,
+                            McpToolCallInfo.STATUS_FAILED, 0, iterIndex);
+                    recordAudit(userId, sessionId, pkgName, toolName, argsStr,
+                            err, McpToolCallInfo.STATUS_FAILED,
+                            HitlConsentStore.CONSENT_DENIED,
+                            (int) (SystemClock.uptimeMillis() - t0), iterIndex);
+                    return err;
+                }
+                // Emit STATUS_PERMISSION_REQUIRED so the launcher pops the
+                // consent UI, and park the dispatcher on a gate.
+                McpToolCallInfo ask = new McpToolCallInfo(sessionId, toolName,
+                        pkgName, svcName, argsStr, null,
+                        System.currentTimeMillis(),
+                        McpToolCallInfo.STATUS_PERMISSION_REQUIRED, -1,
+                        iterIndex);
+                try { callback.onToolCall(ask); } catch (RemoteException re) {}
+
+                ConsentGate gate = new ConsentGate();
+                String gateKey = sessionId + "|" + toolName;
+                mPendingGates.put(gateKey, gate);
+                try {
+                    boolean settled = gate.await(CONSENT_TIMEOUT_MS);
+                    if (!settled || mCanceledSessions.contains(sessionId)) {
+                        gate.resolve(HitlConsentStore.DECISION_DENY,
+                                HitlConsentStore.SCOPE_ONCE,
+                                HitlConsentStore.CONSENT_TIMED_OUT);
+                    }
+                    grantDecision = gate.decision();
+                    int scope = gate.scope();
+                    consentAuditCode = gate.auditCode();
+
+                    if (grantDecision == HitlConsentStore.DECISION_ALLOW
+                            && mConsentStore != null
+                            && scope != HitlConsentStore.SCOPE_ONCE) {
+                        mConsentStore.record(userId, pkgName, toolName,
+                                grantDecision, scope, sessionId);
+                    } else if (grantDecision == HitlConsentStore.DECISION_DENY
+                            && mConsentStore != null
+                            && scope == HitlConsentStore.SCOPE_FOREVER) {
+                        // "Never allow" — persist the deny.
+                        mConsentStore.record(userId, pkgName, toolName,
+                                grantDecision, scope, sessionId);
+                    }
+                } finally {
+                    mPendingGates.remove(gateKey);
+                }
+
+                if (grantDecision != HitlConsentStore.DECISION_ALLOW) {
+                    String err = "{\"error\":\"denied_by_user\"}";
+                    fireToolResult(callback, sessionId, toolName, pkgName,
+                            svcName, argsStr, err,
+                            McpToolCallInfo.STATUS_FAILED, 0, iterIndex);
+                    recordAudit(userId, sessionId, pkgName, toolName, argsStr,
+                            err, McpToolCallInfo.STATUS_FAILED, consentAuditCode,
+                            (int) (SystemClock.uptimeMillis() - t0), iterIndex);
+                    return err;
+                }
+            }
+        }
+
+        // --- Invoke ---
+        // (STARTED already fired up top, before the consent gate.)
+        String result = invokeMcpTool(pkgName, svcName, toolName, argsStr);
+        int duration = (int) (SystemClock.uptimeMillis() - t0);
+        int status = (result != null && result.contains("\"error\""))
+                ? McpToolCallInfo.STATUS_FAILED
+                : McpToolCallInfo.STATUS_COMPLETED;
+        fireToolResult(callback, sessionId, toolName, pkgName, svcName,
+                argsStr, result, status, duration, iterIndex);
+        recordAudit(userId, sessionId, pkgName, toolName, argsStr, result,
+                status, consentAuditCode, duration, iterIndex);
+        return result;
+    }
+
+    private void recordAudit(int userId, String sessionId, String pkg,
+            String tool, String args, String result, int status,
+            int consentDecision, int duration, int iterIndex) {
+        if (mConsentStore == null) return;
+        try {
+            mConsentStore.recordAudit(userId, sessionId, pkg, tool, args,
+                    result, status, consentDecision, duration, iterIndex);
+        } catch (Exception e) {
+            Log.w(TAG, "audit write failed", e);
+        }
+    }
+
+    private boolean isDeviceLocked() {
+        try {
+            KeyguardManager km = mContext.getSystemService(KeyguardManager.class);
+            return km != null && km.isDeviceLocked();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Prevent user prompts from injecting ChatML / tool-call tokens. */
+    private static String escapeChat(String s) {
+        if (s == null) return "";
+        return s.replace("<|im_start|>", "<|im_ start|>")
+                .replace("<|im_end|>", "<|im_ end|>")
+                .replace("<tool_call>", "<tool_ call>")
+                .replace("</tool_call>", "</tool_ call>")
+                .replace("<tool_response>", "<tool_ response>")
+                .replace("</tool_response>", "</tool_ response>");
+    }
+
+    private static String truncateForLog(String s) {
+        if (s == null) return "null";
+        return s.length() <= 200 ? s : s.substring(0, 200) + "…";
+    }
+
+    /**
+     * Watch for package removal so we can prune stale consent grants.
+     * App-upgrade (signature change) is handled lazily on grant lookup.
+     */
+    private void registerPackageMonitor() {
+        IntentFilter f = new IntentFilter();
+        f.addAction(Intent.ACTION_PACKAGE_REMOVED);
+        f.addAction(Intent.ACTION_PACKAGE_FULLY_REMOVED);
+        f.addDataScheme("package");
+        mContext.registerReceiverForAllUsers(new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                if (mConsentStore == null) return;
+                Uri data = intent.getData();
+                if (data == null) return;
+                String pkg = data.getSchemeSpecificPart();
+                boolean replacing = intent.getBooleanExtra(
+                        Intent.EXTRA_REPLACING, false);
+                if (replacing) return; // upgrade — keep grants, signature check gates them
+                Log.i(TAG, "Pruning consent grants for removed pkg " + pkg);
+                mConsentStore.onPackageRemoved(pkg);
+            }
+        }, f, null, null);
+    }
+
+    /** Race-safe one-shot gate for a consent prompt. */
+    private static final class ConsentGate {
+        private final CountDownLatch mLatch = new CountDownLatch(1);
+        // [decision, scope, auditCode]
+        private final AtomicReference<int[]> mResolution = new AtomicReference<>();
+
+        boolean await(long timeoutMs) {
+            try {
+                return mLatch.await(timeoutMs, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+
+        void resolve(int decision, int scope, int auditCode) {
+            if (mResolution.compareAndSet(null,
+                    new int[]{decision, scope, auditCode})) {
+                mLatch.countDown();
+            }
+        }
+
+        int decision() {
+            int[] r = mResolution.get();
+            return r != null ? r[0] : HitlConsentStore.DECISION_DENY;
+        }
+        int scope() {
+            int[] r = mResolution.get();
+            return r != null ? r[1] : HitlConsentStore.SCOPE_ONCE;
+        }
+        int auditCode() {
+            int[] r = mResolution.get();
+            return r != null ? r[2] : HitlConsentStore.CONSENT_TIMED_OUT;
+        }
+    }
+
 
     /**
      * Identity / behavior contract used for both inference passes.
@@ -361,14 +951,19 @@ public class LlmManagerService extends SystemService {
           + "GROUNDING — most important rule\n"
           + "NEVER invent facts. Names, phone numbers, emails, addresses, dates, file contents, and any other specifics MUST come verbatim from a <tool_response>. If a tool returns nothing, say so plainly. Don't soften it (\"I couldn't find an exact match but here's a likely one…\"). Just report that nothing was found.\n"
           + "\n"
-          + "TOOLS\n"
-          + "The OS routes your tool calls to apps the user already installed. Prefer a tool over asking the user. ONLY call tools listed below — never invent one.\n"
+          + "WHEN TO CALL A TOOL\n"
+          + "Only call a tool when answering the user's request requires data only the phone has, OR an action only an app can perform. If you can answer from your own knowledge, do that — don't reach for a tool reflexively.\n"
+          + "BUT — if the user asks you to DO something to their data (add, create, save, send, update, delete, schedule), you MUST call a tool. Never pretend you did it or describe what would happen. Find the matching tool in the list below and call it. If no listed tool fits the requested action, say so plainly.\n"
+          + "ONLY call tools listed below — never invent one. If no listed tool fits the request, answer directly or tell the user you can't.\n"
           + "\n"
           + "When extracting search terms from the user's question, use the bare keyword. Strip possessives ('s), articles (the/a/an), pronouns (my/his/her), and politeness words (please/can you).\n"
           + "    \"what's John's number?\"      → query \"John\"\n"
           + "    \"find me Sarah Chen's email\" → query \"Sarah Chen\"\n"
           + "    \"show my favorite contacts\"  → call list_favorites with no args\n"
-          + "    \"do I have John's email\"     → query \"John\"\n";
+          + "    \"do I have John's email\"     → query \"John\"\n"
+          + "\n"
+          + "CHAINING\n"
+          + "You may call multiple tools in sequence to satisfy one request. Emit AT MOST ONE <tool_call> per turn. After each <tool_response>, decide whether you have enough information to answer; if not, call the next tool. Stop calling tools as soon as you can answer or once a tool can't help. Maximum of 5 tool calls per request.\n";
 
     private static final String OUTPUT_FORMAT_BLOCK =
             "OUTPUT FORMAT\n"
@@ -377,11 +972,20 @@ public class LlmManagerService extends SystemService {
           + "  No prose before or after. The OS handles dispatch and replies in the next turn with <tool_response>...</tool_response>.\n"
           + "- When answering, be concise. 1–3 sentences default. Use a bulleted list for multiple items. Plain text only — no markdown headers, no code fences, no JSON.\n"
           + "- On a tool error, one sentence + one next step.\n"
-          + "- Don't call a tool for general-knowledge questions (\"what time is it\", \"capital of France\"). Answer directly.\n";
+          + "- Don't call a tool for things you already know. Examples that DON'T need a tool: \"what's 2+2\", \"capital of France\", \"how many days in February\". Just answer.\n";
 
     private static final String FEW_SHOT_EXAMPLES =
             "EXAMPLES\n"
           + "\n"
+          + "(direct answer, no tool needed)\n"
+          + "User: what's the capital of France?\n"
+          + "Assistant: Paris.\n"
+          + "\n"
+          + "(launch an app — use launch_app for 'open X' / 'launch X' / 'start X')\n"
+          + "User: open Settings\n"
+          + "Assistant: <tool_call>{\"name\":\"launch_app\",\"arguments\":{\"name\":\"Settings\"}}</tool_call>\n"
+          + "\n"
+          + "(single tool call — read)\n"
           + "User: what's John's number?\n"
           + "Assistant: <tool_call>{\"name\":\"search_contacts\",\"arguments\":{\"query\":\"John\"}}</tool_call>\n"
           + "<tool_response>[{\"name\":\"John Smith\",\"phone\":\"555-1234\"},{\"name\":\"John Appleseed\",\"phone\":\"555-9876\"}]</tool_response>\n"
@@ -390,13 +994,29 @@ public class LlmManagerService extends SystemService {
           + "- John Appleseed — 555-9876\n"
           + "Which one?\n"
           + "\n"
+          + "(single tool call — write. ALWAYS call the tool for add/create/save/send/update requests)\n"
+          + "User: add Sarah Chen to my contacts with phone 555-9999\n"
+          + "Assistant: <tool_call>{\"name\":\"add_contact\",\"arguments\":{\"name\":\"Sarah Chen\",\"phone\":\"555-9999\"}}</tool_call>\n"
+          + "\n"
+          + "(write tool — append to existing contact)\n"
+          + "User: add 555-4321 as John Smith's work number\n"
+          + "Assistant: <tool_call>{\"name\":\"update_contact\",\"arguments\":{\"name\":\"John Smith\",\"phone\":\"555-4321\"}}</tool_call>\n"
+          + "\n"
+          + "(empty result — say so plainly, don't invent)\n"
           + "User: what's Maria's number?\n"
           + "Assistant: <tool_call>{\"name\":\"search_contacts\",\"arguments\":{\"query\":\"Maria\"}}</tool_call>\n"
           + "<tool_response>[]</tool_response>\n"
           + "Assistant: No contact named Maria in your phone.\n"
           + "\n"
-          + "User: what time is it?\n"
-          + "Assistant: It's 9:42 PM.\n";
+          + "(write tool — minimal)\n"
+          + "User: save my mom's number 555-8888\n"
+          + "Assistant: <tool_call>{\"name\":\"add_contact\",\"arguments\":{\"name\":\"Mom\",\"phone\":\"555-8888\"}}</tool_call>\n"
+          + "\n"
+          + "(consent denied by user — don't retry)\n"
+          + "User: add Bob / 555-1111 to my contacts\n"
+          + "Assistant: <tool_call>{\"name\":\"add_contact\",\"arguments\":{\"name\":\"Bob\",\"phone\":\"555-1111\"}}</tool_call>\n"
+          + "<tool_response>{\"error\":\"denied_by_user\"}</tool_response>\n"
+          + "Assistant: I didn't add the contact — you declined.\n";
 
     /** Build the full ChatML system message body (no <|im_start|> wrapper). */
     private String composeSystemPrompt(LlmRequest request) {
@@ -416,17 +1036,6 @@ public class LlmManagerService extends SystemService {
         return sb.toString();
     }
 
-    private String buildPrompt(LlmRequest request) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("<|im_start|>system\n");
-        sb.append(composeSystemPrompt(request));
-        sb.append("<|im_end|>\n");
-        sb.append("<|im_start|>user\n");
-        sb.append(request.prompt);
-        sb.append("\n<|im_end|>\n");
-        sb.append("<|im_start|>assistant\n");
-        return sb.toString();
-    }
 
     /**
      * Build the tools block in Qwen 2.5's expected format. Returns null if
@@ -438,20 +1047,30 @@ public class LlmManagerService extends SystemService {
         java.util.List<McpToolInfo> tools = new java.util.ArrayList<>();
         java.util.Map<String, String> toolToPackage = new java.util.HashMap<>();
         java.util.Map<String, String> toolToService = new java.util.HashMap<>();
+        java.util.Map<String, Boolean> toolRequiresConsent = new java.util.HashMap<>();
         for (McpServerInfo s : allServers) {
             if (s.tools == null) continue;
             for (McpToolInfo t : s.tools) {
                 tools.add(t);
                 toolToPackage.put(t.name, s.packageName);
                 toolToService.put(t.name, s.name);
+                toolRequiresConsent.put(t.name, t.requiresConfirmation);
             }
         }
-        if (tools.isEmpty()) return null;
+        // Always register the built-in launch_app tool — works even when
+        // zero MCP apps are installed. "Open Settings" / "launch Camera"
+        // must not depend on any MCP provider because being launchable
+        // is a universal property of every installed app, not something
+        // any one app should own.
+        toolToPackage.put(TOOL_LAUNCH_APP, BUILTIN_PKG);
+        toolToService.put(TOOL_LAUNCH_APP, BUILTIN_SVC);
+        toolRequiresConsent.put(TOOL_LAUNCH_APP, false);
 
         // Cache the routing tables so the dispatcher can find the service later.
         synchronized (mToolRouteLock) {
             mToolToPackage = toolToPackage;
             mToolToService = toolToService;
+            mToolRequiresConsent = toolRequiresConsent;
         }
 
         StringBuilder sb = new StringBuilder();
@@ -489,6 +1108,15 @@ public class LlmManagerService extends SystemService {
             }
             sb.append("]}}}\n");
         }
+        // Built-in launch_app tool — framework-provided, no MCP required.
+        // Takes a user-facing app name; launcher fuzzy-matches against
+        // installed apps and fires the launch intent itself.
+        sb.append("{\"type\":\"function\",\"function\":{");
+        sb.append("\"name\":\"launch_app\",");
+        sb.append("\"description\":\"Open an installed app. Use this for requests like 'open Settings', 'launch Camera', 'start the browser'. The name argument is the human-readable app name as the user would say it.\",");
+        sb.append("\"parameters\":{\"type\":\"object\",\"properties\":{");
+        sb.append("\"name\":{\"type\":\"string\",\"description\":\"App name as a user would say it (e.g., 'Settings', 'Camera', 'Calendar').\"}");
+        sb.append("},\"required\":[\"name\"]}}}\n");
         sb.append("</tools>\n\n");
         sb.append("For each function call, return a json object with function name and ");
         sb.append("arguments within <tool_call></tool_call> XML tags:\n");
@@ -505,115 +1133,32 @@ public class LlmManagerService extends SystemService {
     private final Object mToolRouteLock = new Object();
     private java.util.Map<String, String> mToolToPackage = new java.util.HashMap<>();
     private java.util.Map<String, String> mToolToService = new java.util.HashMap<>();
+    private java.util.Map<String, Boolean> mToolRequiresConsent = new java.util.HashMap<>();
 
-    /**
-     * If the LLM output contains a <tool_call>{"name":..., "arguments":...}</tool_call>,
-     * bind to the owning MCP service via {@link android.llm.IMcpToolProvider} and invoke
-     * the tool. Returns the tool result text, or null if no tool call was present
-     * or dispatch failed.
-     */
-    private String maybeExecuteToolCall(String llmOutput,
-            ILlmResponseCallback callback, String sessionId) {
-        if (llmOutput == null) return null;
-        int start = llmOutput.indexOf("<tool_call>");
-        if (start < 0) return null;
-        int end = llmOutput.indexOf("</tool_call>", start);
-        if (end < 0) return null;
-        String body = llmOutput.substring(start + "<tool_call>".length(), end).trim();
-        try {
-            org.json.JSONObject obj = new org.json.JSONObject(body);
-            String name = obj.optString("name", null);
-            org.json.JSONObject args = obj.optJSONObject("arguments");
-            if (name == null) {
-                Log.w(TAG, "tool_call missing name: " + body);
-                return null;
-            }
-            String pkgName, svcName;
-            synchronized (mToolRouteLock) {
-                pkgName = mToolToPackage.get(name);
-                svcName = mToolToService.get(name);
-            }
-            String argsStr = args == null ? "{}" : args.toString();
-            if (pkgName == null || svcName == null) {
-                Log.w(TAG, "tool_call for unknown tool: " + name);
-                String err = "{\"error\":\"unknown tool: " + name + "\"}";
-                fireToolResult(callback, sessionId, name, null, null, argsStr, err,
-                        McpToolCallInfo.STATUS_FAILED, 0);
-                return err;
-            }
-            Log.i(TAG, "Dispatching tool " + name + " -> " + pkgName + "/" + svcName);
-            // Fire the STARTED event so the launcher can show "Searching contacts..."
-            // with the owning app's icon.
-            long t0 = android.os.SystemClock.uptimeMillis();
-            fireToolStarted(callback, sessionId, name, pkgName, svcName, argsStr);
-            String result = invokeMcpTool(pkgName, svcName, name, argsStr);
-            int duration = (int) (android.os.SystemClock.uptimeMillis() - t0);
-            int status = (result != null && result.contains("\"error\""))
-                    ? McpToolCallInfo.STATUS_FAILED
-                    : McpToolCallInfo.STATUS_COMPLETED;
-            fireToolResult(callback, sessionId, name, pkgName, svcName, argsStr,
-                    result, status, duration);
-            return result;
-        } catch (Exception e) {
-            Log.w(TAG, "Failed to parse tool_call: " + body, e);
-            return null;
-        }
-    }
+    // ============================================================
+    //  Built-in tools (v0.5) — synthesized by the framework, not
+    //  backed by an MCP service. Using the reserved "android" package
+    //  name as the marker so dispatcher + launcher can recognize them.
+    // ============================================================
+    private static final String BUILTIN_PKG = "android";
+    private static final String BUILTIN_SVC = "<builtin>";
+    private static final String TOOL_LAUNCH_APP = "launch_app";
 
     private void fireToolStarted(ILlmResponseCallback cb, String sessionId,
-            String tool, String pkg, String svc, String args) {
+            String tool, String pkg, String svc, String args, int iterIndex) {
         McpToolCallInfo info = new McpToolCallInfo(sessionId, tool, pkg, svc,
                 args, null, System.currentTimeMillis(),
-                McpToolCallInfo.STATUS_STARTED, -1);
+                McpToolCallInfo.STATUS_STARTED, -1, iterIndex);
         try { cb.onToolCall(info); } catch (RemoteException ignored) {}
     }
 
     private void fireToolResult(ILlmResponseCallback cb, String sessionId,
             String tool, String pkg, String svc, String args, String result,
-            int status, int duration) {
+            int status, int duration, int iterIndex) {
         McpToolCallInfo info = new McpToolCallInfo(sessionId, tool, pkg, svc,
-                args, result, System.currentTimeMillis(), status, duration);
+                args, result, System.currentTimeMillis(), status, duration,
+                iterIndex);
         try { cb.onToolResult(info); } catch (RemoteException ignored) {}
-    }
-
-    /**
-     * Best-effort pretty-print of a tool's JSON result. If it parses as a JSON
-     * array of objects we render rows; if it's an object we render key:value
-     * lines; on error and a Java exception JSON we surface a friendly error;
-     * otherwise we return the raw text.
-     */
-    /**
-     * Build the "round 2" prompt that tells the LLM what tool was just called,
-     * what the result was, and asks it to produce a natural-language answer.
-     * This is the standard agentic loop: user → assistant tool_call →
-     * tool_response → assistant final answer.
-     */
-    private String buildContinuationPrompt(LlmRequest request,
-            String firstRoundOutput, String toolResultJson) {
-        // Same identity, same rules — the AAOSP system prompt is one
-        // contract across both passes. The grounding rule + few-shot
-        // examples in composeSystemPrompt() are what teach the model
-        // to render tool results faithfully (no fabrication, no
-        // omission); no bandaid prose needed here anymore.
-        StringBuilder sb = new StringBuilder();
-        sb.append("<|im_start|>system\n");
-        sb.append(composeSystemPrompt(request));
-        sb.append("<|im_end|>\n");
-        sb.append("<|im_start|>user\n").append(request.prompt).append("\n<|im_end|>\n");
-        // Echo the first-round tool_call back as the assistant turn so
-        // the model has its own action in chat history.
-        String toolCallLine = "";
-        int s = firstRoundOutput.indexOf("<tool_call>");
-        int e = firstRoundOutput.indexOf("</tool_call>", s);
-        if (s >= 0 && e > s) {
-            toolCallLine = firstRoundOutput.substring(s, e + "</tool_call>".length());
-        }
-        sb.append("<|im_start|>assistant\n").append(toolCallLine).append("\n<|im_end|>\n");
-        sb.append("<|im_start|>user\n<tool_response>\n");
-        sb.append(toolResultJson);
-        sb.append("\n</tool_response>\n<|im_end|>\n");
-        sb.append("<|im_start|>assistant\n");
-        return sb.toString();
     }
 
     /** Belt-and-suspenders cleaning of any chat tokens the model might leak. */
@@ -628,48 +1173,6 @@ public class LlmManagerService extends SystemService {
              .replace("assistant\n", "")
              .replace("user\n", "");
         return s.trim();
-    }
-
-    private static String humanizeToolResult(String json) {
-        if (json == null) return "(no result)";
-        String s = json.trim();
-        try {
-            if (s.startsWith("[")) {
-                org.json.JSONArray arr = new org.json.JSONArray(s);
-                if (arr.length() == 0) return "(no results)";
-                StringBuilder out = new StringBuilder();
-                for (int i = 0; i < arr.length(); i++) {
-                    if (i > 0) out.append("\n");
-                    Object item = arr.get(i);
-                    if (item instanceof org.json.JSONObject) {
-                        org.json.JSONObject o = (org.json.JSONObject) item;
-                        boolean first = true;
-                        java.util.Iterator<String> keys = o.keys();
-                        while (keys.hasNext()) {
-                            String k = keys.next();
-                            if (!first) out.append(" · ");
-                            out.append(o.optString(k, ""));
-                            first = false;
-                        }
-                    } else {
-                        out.append(item.toString());
-                    }
-                }
-                return out.toString();
-            }
-            if (s.startsWith("{")) {
-                org.json.JSONObject o = new org.json.JSONObject(s);
-                if (o.has("error")) return "Error: " + o.optString("error");
-                StringBuilder out = new StringBuilder();
-                java.util.Iterator<String> keys = o.keys();
-                while (keys.hasNext()) {
-                    String k = keys.next();
-                    out.append(k).append(": ").append(o.optString(k, "")).append("\n");
-                }
-                return out.toString().trim();
-            }
-        } catch (Exception ignored) {}
-        return s;
     }
 
     private String invokeMcpTool(String pkgName, String svcName,

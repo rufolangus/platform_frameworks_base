@@ -1377,6 +1377,10 @@ UnflaggedApi: android.Manifest.permission#BIND_LLM_MCP_SERVICE:
     New API must be flagged with @FlaggedApi: field android.Manifest.permission.BIND_LLM_MCP_SERVICE
 UnflaggedApi: android.Manifest.permission#SUBMIT_LLM_REQUEST:
     New API must be flagged with @FlaggedApi: field android.Manifest.permission.SUBMIT_LLM_REQUEST
+UnflaggedApi: android.R.attr#mcpRequired:
+    New API must be flagged with @FlaggedApi: field android.R.attr.mcpRequired
+UnflaggedApi: android.R.attr#mcpRequiresConfirmation:
+    New API must be flagged with @FlaggedApi: field android.R.attr.mcpRequiresConfirmation
 UnflaggedApi: android.R.color#on_surface_disabled_material:
     New API must be flagged with @FlaggedApi: field android.R.color.on_surface_disabled_material
 UnflaggedApi: android.R.color#outline_disabled_material:

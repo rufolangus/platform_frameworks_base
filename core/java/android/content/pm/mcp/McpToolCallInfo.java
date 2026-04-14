@@ -99,10 +99,19 @@ public final class McpToolCallInfo implements Parcelable {
      */
     public final int durationMillis;
 
+    /**
+     * Zero-based position of this call within a chained agentic loop.
+     * {@code 0} for single-call exchanges. Lets clients render each
+     * step in the chain accumulating in chat scroll instead of one
+     * card overwriting the previous.
+     */
+    public final int iterationIndex;
+
     public McpToolCallInfo(String sessionId, String toolName,
             String packageName, String serviceName,
             String argumentsJson, String resultJson,
-            long timestampMillis, @Status int status, int durationMillis) {
+            long timestampMillis, @Status int status, int durationMillis,
+            int iterationIndex) {
         this.sessionId = sessionId;
         this.toolName = toolName;
         this.packageName = packageName;
@@ -112,6 +121,7 @@ public final class McpToolCallInfo implements Parcelable {
         this.timestampMillis = timestampMillis;
         this.status = status;
         this.durationMillis = durationMillis;
+        this.iterationIndex = iterationIndex;
     }
 
     private McpToolCallInfo(Parcel in) {
@@ -124,6 +134,7 @@ public final class McpToolCallInfo implements Parcelable {
         timestampMillis = in.readLong();
         status = in.readInt();
         durationMillis = in.readInt();
+        iterationIndex = in.readInt();
     }
 
     @Override
@@ -137,6 +148,7 @@ public final class McpToolCallInfo implements Parcelable {
         dest.writeLong(timestampMillis);
         dest.writeInt(status);
         dest.writeInt(durationMillis);
+        dest.writeInt(iterationIndex);
     }
 
     @Override

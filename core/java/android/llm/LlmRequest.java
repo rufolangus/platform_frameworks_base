@@ -72,6 +72,24 @@ public final class LlmRequest implements Parcelable {
      */
     public final boolean requestServerUi;
 
+    /**
+     * Maximum tool-call iterations the dispatcher may chain on this
+     * request. {@code 0} means service default (currently 5). Hard
+     * cap is 8 — values above are clamped. Set to {@code 1} for
+     * single-tool exchanges (no chaining).
+     */
+    public final int maxToolCalls;
+
+    /**
+     * Continue a prior conversation. Null = start a new session;
+     * service generates a fresh UUID and returns it. Pass it back on
+     * subsequent submits to thread the conversation. The launcher's
+     * "New chat" affordance should set this back to null AND call
+     * {@link android.llm.ILlmService#endSession(String)} on the
+     * previous id so SESSION-scoped consent grants are cleared.
+     */
+    public final String sessionId;
+
     private LlmRequest(Builder builder) {
         this.prompt = builder.prompt;
         this.systemPrompt = builder.systemPrompt;
@@ -81,6 +99,8 @@ public final class LlmRequest implements Parcelable {
         this.allowedTools = builder.allowedTools;
         this.conversationJson = builder.conversationJson;
         this.requestServerUi = builder.requestServerUi;
+        this.maxToolCalls = builder.maxToolCalls;
+        this.sessionId = builder.sessionId;
     }
 
     private LlmRequest(Parcel in) {
@@ -92,6 +112,8 @@ public final class LlmRequest implements Parcelable {
         allowedTools = in.createStringArrayList();
         conversationJson = in.readString();
         requestServerUi = in.readBoolean();
+        maxToolCalls = in.readInt();
+        sessionId = in.readString();
     }
 
     @Override
@@ -104,6 +126,8 @@ public final class LlmRequest implements Parcelable {
         dest.writeStringList(allowedTools);
         dest.writeString(conversationJson);
         dest.writeBoolean(requestServerUi);
+        dest.writeInt(maxToolCalls);
+        dest.writeString(sessionId);
     }
 
     @Override
@@ -135,6 +159,8 @@ public final class LlmRequest implements Parcelable {
         private List<String> allowedTools;
         private String conversationJson;
         private boolean requestServerUi = false;
+        private int maxToolCalls = 0;
+        private String sessionId = null;
 
         public Builder(String prompt) {
             if (prompt == null) throw new NullPointerException("prompt");
@@ -173,6 +199,23 @@ public final class LlmRequest implements Parcelable {
 
         public Builder setRequestServerUi(boolean requestServerUi) {
             this.requestServerUi = requestServerUi;
+            return this;
+        }
+
+        /**
+         * Maximum tool-call iterations for this request. 0 = default.
+         * Clamped to [1, 8].
+         */
+        public Builder setMaxToolCalls(int n) {
+            this.maxToolCalls = n;
+            return this;
+        }
+
+        /**
+         * Continue an existing session. Null = new session.
+         */
+        public Builder setSessionId(String sessionId) {
+            this.sessionId = sessionId;
             return this;
         }
 
